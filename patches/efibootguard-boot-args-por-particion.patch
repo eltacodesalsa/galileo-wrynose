@@ -1,0 +1,36 @@
+diff --git a/scripts/lib/wic/plugins/source/efibootguard_boot.py b/scripts/lib/wic/plugins/source/efibootguard_boot.py
+index c9f51e4..2da5928 100644
+--- a/scripts/lib/wic/plugins/source/efibootguard_boot.py
++++ b/scripts/lib/wic/plugins/source/efibootguard_boot.py
+@@ -37,6 +37,22 @@ from wic.misc import exec_cmd, exec_native_cmd, get_bitbake_var, \
+ 
+ msger = logging.getLogger('wic')
+ 
++def _galileo_args(cmdline, source_params):
++    """galileo: conservar el resto del cmdline cuando se da 'args'.
++
++    wic mete 'root=PARTLABEL=<raiz>' en el cmdline global. Si 'args' lo
++    reemplazara entero, cada entorno perderia la consola: la coma de
++    console=ttyS1,115200n8 no se puede pasar por --sourceparams porque se
++    separan por comas. Aqui 'args' define solo la raiz y el resto del cmdline
++    (rootwait, consola) se conserva.
++    """
++    args = source_params.get("args")
++    if not args:
++        return cmdline.strip()
++    resto = " ".join(t for t in cmdline.split() if not t.startswith("root=PARTLABEL="))
++    return (args + " " + resto).strip()
++
++
+ class EfibootguardBootPlugin(SourcePlugin):
+     """
+     Create boot partition.
+@@ -79,7 +95,7 @@ class EfibootguardBootPlugin(SourcePlugin):
+         config_cmd = 'bg_setenv -f . -k "C:%s:%s" -a "%s" -r %s -w %s' % \
+                       (part.label.upper(), \
+                        kernel_dst, \
+-                       source_params.get("args", cmdline.strip()), \
++                       _galileo_args(cmdline, source_params), \
+                        source_params.get("revision", 1), \
+                        source_params.get("watchdog", 5))
+ 

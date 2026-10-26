@@ -1,0 +1,16 @@
+# /etc/network/interfaces -- ifup(8) / ifdown(8)
+# Esta imagen usa ifupdown: galileosetup reescribe este archivo.
+
+auto lo
+iface lo inet loopback
+
+# IP por DEFECTO, igual que la imagen de Siemens: la placa siempre responde en
+# 192.168.200.1 aunque no haya router ni DHCP. Un PC en 192.168.200.x llega
+# directo con un cable.
+auto eth0
+iface eth0 inet static
+	address 192.168.200.1
+	netmask 255.255.255.0
+
+# wlan0 NO se levanta sola: se configura desde galileosetup (SSID y clave), que
+# anade el bloque con wpa_supplicant. Asi el arranque no falla si no hay WiFi.

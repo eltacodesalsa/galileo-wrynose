@@ -1,0 +1,6 @@
+# Coloca aqui la clave PUBLICA del administrador, una por linea, y define en el
+# build (local.conf NO versionado):
+#   GALILEO_ADMIN_KEY = "ssh-ed25519 AAAA... usuario@maquina"
+#
+# La imagen publicada NO incluye ninguna clave: tras flashearla, el acceso es por
+# la consola serie (root, sin contrasena) hasta que provisiones la tuya.

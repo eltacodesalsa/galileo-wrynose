@@ -1,0 +1,107 @@
+# kas-galileo.yml — composición reproducible de galileo-wrynose
+#
+# Uso:
+#   kas-container build kas-galileo.yml
+#   kas-container shell kas-galileo.yml
+#
+# IMPORTANTE — en Yocto 6.0 "wrynose" **poky ya no existe como repositorio
+# combinado**. El árbol se arma con tres repos separados:
+#     openembedded-core (meta)  +  bitbake  +  meta-yocto (meta-poky, meta-yocto-bsp)
+# Este archivo refleja eso. El árbol de desarrollo de José se montó con los
+# TARBALLS de la release 6.0.4 (por eso esos tres directorios no tienen .git);
+# aquí se declaran los repos git equivalentes para que otra persona pueda
+# reproducirlo.
+#
+# POLÍTICA: revisiones pineadas, nunca ramas móviles. Donde no hay tag verificado
+# se deja el commit exacto del árbol que sí compiló.
+
+header:
+  version: 14
+
+machine: iot2000
+distro: galileo-wrynose        # conf/distro/galileo-wrynose.conf en esta capa
+target: galileo-image
+
+repos:
+  # --- base: Yocto 6.0.4 "wrynose" -----------------------------------------
+  openembedded-core:
+    url: https://git.openembedded.org/openembedded-core
+    branch: wrynose
+    # tag: yocto-6.0.4        # preferible cuando el tag esté verificado
+    layers:
+      meta:
+
+  bitbake:
+    url: https://git.openembedded.org/bitbake
+    branch: 2.12
+    # nuestro árbol trae BitBake 2.12.1; kas lo detecta como el motor de build,
+    # no como una capa
+
+  meta-yocto:
+    url: https://git.yoctoproject.org/meta-yocto
+    branch: wrynose
+    # tag: yocto-6.0.4
+    layers:
+      meta-poky:
+      meta-yocto-bsp:
+
+  meta-openembedded:
+    url: https://git.openembedded.org/meta-openembedded
+    branch: wrynose
+    layers:
+      meta-oe:
+      meta-python:
+      meta-networking:
+
+  # --- arranque A/B y OTA (fuera de la release 6.0.4) ----------------------
+  meta-efibootguard:
+    url: https://github.com/siemens/meta-efibootguard
+    branch: wrynose
+    commit: 602af5f3fa6243105584b546c8fe3cf4e99cf703
+    # OJO: esta capa se parchea localmente (patches/efibootguard-boot-args-por-particion.patch)
+    # para que 'args' defina solo la raiz y conserve el resto del cmdline. Sin ese
+    # parche, boot1 arranca la raiz equivocada.
+    layers:
+      .:
+
+  meta-swupdate:
+    url: https://github.com/sbabic/meta-swupdate
+    branch: master
+    commit: 674c27fc2e0ab67b7f93d214171156da9c01c8e8
+    layers:
+      .:
+
+  # --- esta capa ------------------------------------------------------------
+  meta-galileo:
+    path: .
+
+# NO se incluye meta-iot2000 de Siemens: su LAYERSERIES_COMPAT es "dunfell" y en
+# 6.0 no carga. De esa capa se portaron a esta lo necesario: la definición de
+# máquina, el tune i586-nlp, el layout del .wks y la receta de acpi-upgrades.
+
+local_conf_header:
+  galileo-reproducibilidad: |
+    # Guardar tarballs para poder reconstruir sin red (mirror propio).
+    BB_GENERATE_MIRROR_TARBALLS = "1"
+    # Un fragmento de config del kernel que no llega a aplicarse NO debe pasar
+    # en silencio: es el fallo que nos costo un kernel con 73 instrucciones LOCK.
+    KCONF_AUDIT_LEVEL = "1"
+    KCONF_BSP_AUDIT_LEVEL = "1"
+
+  galileo-identidad: |
+    # La capa define conf/distro/galileo-wrynose.conf pero local.conf NO lo
+    # seleccionaba: el sistema caia en "nodistro" y el banner decia
+    # "OpenEmbedded nodistro.0". Aqui se selecciona explicitamente.
+    DISTRO = "galileo-wrynose"
+
+  galileo-imagen: |
+    # El .wic se comprime y se publica; no hacer debug-pkgs ni tools-sdk.
+    IMAGE_FSTYPES = "wic.bz2"
+    # Fallar en el build si la raiz no cabe en la particion de 2 GB del layout A/B.
+    IMAGE_ROOTFS_MAXSIZE = "1900"
+
+# Nota sobre root y SSH:
+# NO se bloquea root con "usermod -p '!'" (la version anterior de este archivo lo
+# hacia). El diseño es: contrasena vacia SOLO en la consola serie (PAM
+# nullok_secure + empty-root-password) y SSH con llave publica y
+# "PermitRootLogin prohibit-password". Ver recipes-core/galileo-ssh-key.

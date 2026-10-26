@@ -1,0 +1,16 @@
+[Unit]
+Description=Confirma el arranque ante EFI Boot Guard (ustate -> 0)
+Documentation=file:///usr/share/doc/galileo-confirm/README
+After=network-online.target galileo-network.service galileo-watchdog.service
+Wants=network-online.target
+ConditionPathExists=/usr/bin/bg_setenv
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/galileo-confirm
+# margen de sobra para que la red este arriba; el watchdog de 60 s manda
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

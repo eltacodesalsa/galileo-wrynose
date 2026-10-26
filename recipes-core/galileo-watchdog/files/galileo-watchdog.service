@@ -1,0 +1,17 @@
+[Unit]
+Description=Alimentador del watchdog de hardware (ie6xx_wdt bloqueado por firmware)
+Documentation=file:///usr/share/doc/galileo-watchdog/README
+# el timer lo arma EFI Boot Guard a 60 s; hay que empezar a alimentarlo cuanto antes
+DefaultDependencies=no
+After=systemd-udev-settle.service local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=simple
+# -F = no demonizar (systemd lo supervisa), -T 20 = ping cada 20 s contra un timeout de 60 s
+ExecStart=/usr/sbin/watchdog -F -T 20 /dev/watchdog
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

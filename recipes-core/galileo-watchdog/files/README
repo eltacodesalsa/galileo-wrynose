@@ -1,0 +1,12 @@
+galileo-watchdog
+===============
+
+El watchdog IE6xx de la Galileo queda BLOQUEADO por el firmware (WDTLR=0x3) y
+EFI Boot Guard lo arma a 60 segundos antes de cargar el kernel. El driver marca
+WDOG_HW_RUNNING y no permite pararlo, asi que hace falta un proceso en userspace
+haciendo ping; si no, la placa se reinicia a los 60 s (sintoma: se reinicia al
+llegar al login).
+
+Esta unidad ejecuta el applet 'watchdog' de busybox alimentandolo cada 20 s.
+Si el proceso muere, systemd lo reinicia; si el sistema se cuelga de verdad, el
+hardware reinicia la placa: eso es justo lo que se busca.

@@ -1,0 +1,1325 @@
+#!/bin/sh
+# galileosetup — multi-screen setup utility for the Intel Galileo Gen 2 /
+# Siemens SIMATIC IOT2000 (Intel Quark X1000).
+# Project: galileo-wrynose · License: MIT · Version 0.2
+#
+# Dependency-free (no snack, no mraa, no Python): plain shell + ANSI escapes.
+# GPIO/PWM are deliberately out of scope: mraa assumed the kernel 4.4 pin
+# numbering and modern kernels expose dynamic gpiochips, so such a tool would
+# silently lie.
+#
+# Interactive:   galileosetup
+# Scriptable:    galileosetup --status
+#                galileosetup --hostname NAME
+#                galileosetup --password 'secret'
+#                galileosetup --tz COUNTRY|ZONE
+#                galileosetup --wifi SSID PASSPHRASE
+#                galileosetup --eth dhcp [IFACE]
+#                galileosetup --eth IP [SUBNET] [GATEWAY] [IFACE]
+#                galileosetup --serial rs232|rs422|rs485
+#
+# GALILEOSETUP_ETC overrides /etc (used for tests: nothing real is touched).
+
+VERSION="0.2"
+ETC="${GALILEOSETUP_ETC:-/etc}"
+ZONEINFO="${GALILEOSETUP_ZONEINFO:-/usr/share/zoneinfo}"
+IFACES="$ETC/network/interfaces"
+WPA="$ETC/wpa_supplicant.conf"
+HOSTFILE="$ETC/hostname"
+TZFILE="$ETC/timezone"
+LOCALTIME="$ETC/localtime"
+STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo manual)"
+TTY=/dev/tty
+ESC=$(printf '\033')
+# OJO: $(printf '\n') es VACIO (la sustitucion de comandos come el salto final).
+# Para tener los caracteres reales se usa el truco del centinela.
+NL=$(printf '\nx'); NL=${NL%x}
+CR=$(printf '\rx'); CR=${CR%x}
+DEL=$(printf '\177x'); DEL=${DEL%x}
+BS=$(printf '\bx'); BS=${BS%x}
+
+red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
+green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
+blue()  { printf '\033[1;34m%s\033[0m\n' "$*"; }
+
+# ---------------------------------------------------------------- terminal ---
+# CLAVE: nunca capturar un byte con $(dd ...) — la sustitución de comandos borra
+# los saltos de línea finales, así que Enter (0x0a) se convierte en cadena vacía
+# y se pierde. Medido: x=$(printf '\n') -> longitud 0. Por eso se lee SIEMPRE por
+# tubería a od y se compara en HEXADECIMAL.
+_stty_save=""
+RAW=0
+# Cada llamada a stty usa TCSAFLUSH: descarta lo que el usuario ya tecleo. Por eso
+# ambas son IDEMPOTENTES y no se llama stty si ya estamos en el modo pedido.
+raw_on() {
+    [ -r "$TTY" ] || return 1
+    [ "$RAW" = 1 ] && return 0
+    [ -z "$_stty_save" ] && _stty_save=$(stty -g < "$TTY" 2>/dev/null)
+    stty -icanon -echo min 1 time 0 < "$TTY" 2>/dev/null
+    printf '\033[?25l'      # oculta el cursor
+    RAW=1
+}
+raw_off() {
+    [ "$RAW" = 0 ] && return 0
+    [ -n "$_stty_save" ] && stty "$_stty_save" < "$TTY" 2>/dev/null
+    RAW=0
+}
+raw_restore() {
+    printf '\033[?25h'      # devuelve el cursor al shell
+    raw_off
+    _stty_save=""
+}
+
+# read_byte -> BYTE_HEX : "0a", "1b", "71"… o "" si no hay datos.
+# NO se usa 'od -An -tx1': el od de busybox de la imagen se compilo SIN -A ni -t
+# (usage: od [-abcdeFfhiloxsv]) y fallaba con "invalid option -- 'A'".
+# 'od -x' existe en todas las versiones: imprime "0000000 000a" y el byte esta en
+# el campo 2 (2 bytes hex, el valor en la mitad baja).
+read_byte() {
+    _h=$(dd if="$TTY" bs=1 count=1 2>/dev/null | od -x 2>/dev/null | awk 'NR==1{print $2}')
+    case "$_h" in
+        "")              BYTE_HEX="" ;;                  # sin datos / EOF
+        *[!0-9a-fA-F]*)  BYTE_HEX="" ;;                  # salida no reconocida
+        *)               BYTE_HEX=$(printf '%02x' "$((0x$_h))") ;;
+    esac
+}
+
+# hex_to_char 61 -> "a"  (para reconstruir caracteres imprimibles)
+hex_to_char() {
+    printf "\\$(printf '%03o' $((0x$1)))"
+}
+
+# up down left right enter tab backspace esc quit eof other
+read_key() {
+    read_byte
+    case "$BYTE_HEX" in
+        0a|0d) echo enter ;;
+        09)    echo tab ;;
+        7f|08) echo backspace ;;
+        71|51) echo quit ;;                       # q Q
+        1b)    # ESC: ventana corta (VTIME) para el resto de la secuencia
+               stty min 0 time 1 < "$TTY" 2>/dev/null
+               read_byte; _a="$BYTE_HEX"
+               read_byte; _b="$BYTE_HEX"
+               stty min 1 time 0 < "$TTY" 2>/dev/null
+               case "$_a$_b" in
+                   5b41|4f41) echo up ;;
+                   5b42|4f42) echo down ;;
+                   5b43|4f43) echo right ;;
+                   5b44|4f44) echo left ;;
+                   "")        echo esc ;;
+                   *)         echo other ;;
+               esac ;;
+        "") echo eof ;;
+        *)  echo other ;;
+    esac
+}
+
+# ---------------------------------------------------------------- geometry ---
+W=80; PAD=66; ART=simple; ROWS=24
+setup_geom() {
+    # Cacheado: 'stty size' en cada redibujo abria el tty entre campo y campo y
+    # descartaba lo tecleado por adelantado (medido: el 2o campo secreto salia vacio).
+    [ -n "${_GEOM_LISTA:-}" ] && return 0
+    _GEOM_LISTA=1
+    _sz=$(stty size < "$TTY" 2>/dev/null)
+    ROWS=${_sz% *}; COLS=${_sz#* }
+    case "$ROWS" in ''|*[!0-9]*) ROWS=24 ;; esac
+    case "$COLS" in ''|*[!0-9]*) COLS=80 ;; esac
+    [ "$ROWS" -ge 10 ] 2>/dev/null || ROWS=24
+    [ "$COLS" -ge 40 ] 2>/dev/null || COLS=80
+    W=80; PAD=66; ART=simple
+    if [ "$COLS" -ge 90 ] && [ "$ROWS" -ge 28 ]; then W=90; PAD=76; ART=full; fi
+    if [ "$ROWS" -lt 22 ]; then ART=none; fi
+    FRAME=$(printf '%*s' "$W" '' | tr ' ' '#')
+    RULE=$(printf '%*s' $((W - 12)) '' | tr ' ' '-')
+}
+
+# ----------------------------------------------------------------- drawing ---
+ROW=0
+emit() { printf '%s\n' "$1"; ROW=$((ROW + 1)); }
+blankrow() { emit "###$(printf "%$((W - 6))s" '')###"; }
+pad()  { printf "%-${PAD}s" "$1"; }
+plain()  { emit "###   |$(pad "$1")|   ###"; }
+hilite() { emit "###   |${ESC}[7m$(pad "$1")${ESC}[0m|   ###"; }
+
+header() {   # $1 = screen title
+    # Estilo newt: NO se borra la pantalla (eso produce el destello y manda 2 KB
+    # por tecla a 115200). Se lleva el cursor al inicio y se sobrescribe.
+    [ -t 1 ] && printf '\033[H' 
+    ROW=0
+    setup_geom
+    emit "$FRAME"
+    case "$ART" in
+        full)
+            emit "###    █████████    █████████   █████       █████ █████       ██████████    ███████    ###"
+            emit "###   ███░░░░░███  ███░░░░░███ ░░███       ░░███ ░░███       ░░███░░░░░█  ███░░░░░███  ###"
+            emit "###  ███     ░░░  ░███    ░███  ░███        ░███  ░███        ░███  █ ░  ███     ░░███ ###"
+            emit "### ░███          ░███████████  ░███        ░███  ░███        ░██████   ░███      ░███ ###"
+            emit "### ░███    █████ ░███░░░░░███  ░███        ░███  ░███        ░███░░█   ░███      ░███ ###"
+            emit "### ░░███  ░░███  ░███    ░███  ░███      █ ░███  ░███      █ ░███ ░   █░░███     ███  ###"
+            emit "###  ░░█████████  █████   █████ ███████████ █████ ███████████ ██████████ ░░░███████░   ###"
+            emit "###   ░░░░░░░░░  ░░░░░   ░░░░░ ░░░░░░░░░░░ ░░░░░ ░░░░░░░░░░░ ░░░░░░░░░░    ░░░░░░░     ###" ;;
+        simple)
+            emit "###            ______ _______        _____        _______  _____             ###"
+            emit "###           |  ____ |_____| |        |   |      |______ |     |            ###"
+            emit "###           |_____| |     | |_____ __|__ |_____ |______ |_____|            ###" ;;
+        none) : ;;
+    esac
+    blankrow
+    _t="SETUP UTILITY"; _padn=$(( (W - 6 - ${#_t}) / 2 ))
+    emit "###$(printf '%*s%s%*s' "$_padn" '' "$_t" $(( W - 6 - _padn - ${#_t} )) '')###"
+    blankrow
+    emit "###   $RULE   ###"
+    _padn=$(( (PAD - ${#1}) / 2 ))
+    TITLE_ROW=$((ROW + 1))
+    plain "$(printf '%*s%s%*s' "$_padn" '' "$1" $(( PAD - _padn - ${#1} )) '')"
+    emit "###   $RULE   ###"
+    emit "###   |$(pad '')|   ###"
+}
+
+footer() {
+    emit "###   |$(pad '')|   ###"
+    emit "###   $RULE   ###"
+    blankrow
+    emit "$FRAME"
+    case "$ART" in
+        none) printf "%-80s\n" "  up/down move | Enter select | q quit" ;;
+        *)    printf "%-80s\n" "   up/down move   |   Enter select   |   q quit" ;;
+    esac
+    [ -t 1 ] && printf '\033[J'     # borra lo que sobre por debajo
+}
+
+# Record where a field value starts so we can put the cursor there.
+FIELD_ROW=0
+# field <label> <valor> <plain|secret> [hl] : dibuja una fila de campo.
+field() {   # $1 label, $2 valor, $3 plain|secret, $4 hl
+    # Ancho a prueba de etiquetas largas: la etiqueta se RECORTA a 12 (%-12.12s)
+    # y el relleno se calcula con el espacio que queda. Antes un label de 18
+    # caracteres desbordaba la linea y rompia el recuadro.
+    _lbl=$(printf "%-12.12s" "$1:")
+    _val="$2"; [ "$3" = secret ] && _val=$(printf "%*s" "${#2}" "" | tr " " "*")
+    _w=$((PAD - 17))                       # 4 margen + 12 etiqueta + 1 sep
+    [ "${#_val}" -gt "$_w" ] && _val=$(printf "%s" "$_val" | cut -c1-"$_w")
+    _fill=$(printf "%*s" $((_w - ${#_val})) "" | tr " " "_")
+    FIELD_ROW=$((ROW + 1))
+    _c=$(printf "    %-12s %s" "$_lbl" "$_val$_fill")
+    _c=$(printf "%-${PAD}.${PAD}s" "$_c")
+    if [ "$4" = hl ]; then
+        emit "###   |${ESC}[7m${_c}${ESC}[0m|   ###"
+    else
+        emit "###   |${_c}|   ###"
+    fi
+}
+
+
+# --------------------------------------------------------------- utilities ---
+ensure_dir() { mkdir -p "$(dirname "$1")" 2>/dev/null; }
+backup() {
+    ensure_dir "$1"; [ -f "$1" ] || return 0
+    cp -p "$1" "$1.bak-$STAMP" 2>/dev/null && printf '  backup: %s.bak-%s\n' "$1" "$STAMP"
+}
+
+ip_valid() {
+    echo "$1" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || return 1
+    _ifs=$IFS; IFS=.; set -- $1; IFS=$_ifs
+    [ $# -eq 4 ] || return 1
+    for o in "$@"; do [ "$o" -le 255 ] 2>/dev/null || return 1; done
+    return 0
+}
+
+# Zonas por pais: "zona|etiqueta legible". Si el pais tiene varias, se elige.
+# Se filtran en tiempo de ejecucion contra $ZONEINFO, asi que si la imagen no
+# trae alguna no se ofrece (nunca se escribe una zona inexistente).
+zones_for_country() {
+    _lc=$(echo "$1" | tr 'A-Z' 'a-z' | sed 's/^ *//; s/ *$//')
+    case "$_lc" in
+        mexico)
+            echo "America/Mexico_City|Central - Mexico City, Monterrey, Guadalajara"
+            echo "America/Cancun|Southeast - Cancun (no DST)"
+            echo "America/Merida|Southeast - Merida"
+            echo "America/Matamoros|Border - Matamoros"
+            echo "America/Ciudad_Juarez|Border - Ciudad Juarez"
+            echo "America/Ojinaga|Border - Ojinaga"
+            echo "America/Chihuahua|Mountain - Chihuahua"
+            echo "America/Mazatlan|Pacific - Mazatlan, Los Cabos"
+            echo "America/Bahia_Banderas|Pacific - Puerto Vallarta"
+            echo "America/Hermosillo|Sonora - Hermosillo (no DST)"
+            echo "America/Tijuana|Baja California - Tijuana, Mexicali" ;;
+        "united states"|usa|us|"united states of america")
+            echo "America/New_York|Eastern"
+            echo "America/Chicago|Central"
+            echo "America/Denver|Mountain"
+            echo "America/Phoenix|Arizona (no DST)"
+            echo "America/Los_Angeles|Pacific"
+            echo "America/Anchorage|Alaska"
+            echo "Pacific/Honolulu|Hawaii (no DST)"
+            echo "America/Puerto_Rico|Puerto Rico" ;;
+        canada)
+            echo "America/St_Johns|Newfoundland"
+            echo "America/Halifax|Atlantic"
+            echo "America/Toronto|Eastern"
+            echo "America/Winnipeg|Central"
+            echo "America/Regina|Saskatchewan (no DST)"
+            echo "America/Edmonton|Mountain"
+            echo "America/Vancouver|Pacific" ;;
+        brazil|brasil)
+            echo "America/Sao_Paulo|Brasilia time"
+            echo "America/Manaus|Amazon time"
+            echo "America/Belem|Para"
+            echo "America/Cuiaba|Mato Grosso"
+            echo "America/Recife|Pernambuco"
+            echo "America/Fortaleza|Fortaleza"
+            echo "America/Rio_Branco|Acre"
+            echo "America/Noronha|Fernando de Noronha" ;;
+        russia)
+            echo "Europe/Kaliningrad|Kaliningrad"
+            echo "Europe/Moscow|Moscow"
+            echo "Europe/Samara|Samara"
+            echo "Asia/Yekaterinburg|Yekaterinburg"
+            echo "Asia/Omsk|Omsk"
+            echo "Asia/Novosibirsk|Novosibirsk"
+            echo "Asia/Krasnoyarsk|Krasnoyarsk"
+            echo "Asia/Irkutsk|Irkutsk"
+            echo "Asia/Yakutsk|Yakutsk"
+            echo "Asia/Vladivostok|Vladivostok"
+            echo "Asia/Magadan|Magadan"
+            echo "Asia/Kamchatka|Kamchatka" ;;
+        australia)
+            echo "Australia/Sydney|New South Wales, Victoria"
+            echo "Australia/Brisbane|Queensland (no DST)"
+            echo "Australia/Adelaide|South Australia"
+            echo "Australia/Darwin|Northern Territory (no DST)"
+            echo "Australia/Perth|Western Australia"
+            echo "Australia/Hobart|Tasmania" ;;
+        indonesia)
+            echo "Asia/Jakarta|West (Jakarta)"
+            echo "Asia/Pontianak|Central"
+            echo "Asia/Makassar|Central (Makassar)"
+            echo "Asia/Jayapura|East (Jayapura)" ;;
+        chile)
+            echo "America/Santiago|Continental"
+            echo "America/Punta_Arenas|Magallanes"
+            echo "Pacific/Easter|Easter Island" ;;
+        argentina)
+            echo "America/Argentina/Buenos_Aires|Buenos Aires"
+            echo "America/Argentina/Cordoba|Cordoba"
+            echo "America/Argentina/Mendoza|Mendoza"
+            echo "America/Argentina/Salta|Salta"
+            echo "America/Argentina/Ushuaia|Ushuaia" ;;
+        spain|espana|"españa")
+            echo "Europe/Madrid|Mainland"
+            echo "Atlantic/Canary|Canary Islands" ;;
+        portugal)
+            echo "Europe/Lisbon|Mainland"
+            echo "Atlantic/Azores|Azores" ;;
+        "new zealand")
+            echo "Pacific/Auckland|Mainland"
+            echo "Pacific/Chatham|Chatham Islands" ;;
+        # --- un solo huso ---
+        guatemala) echo "America/Guatemala|Guatemala" ;;
+        belize) echo "America/Belize|Belize" ;;
+        honduras) echo "America/Tegucigalpa|Honduras" ;;
+        "el salvador") echo "America/El_Salvador|El Salvador" ;;
+        nicaragua) echo "America/Managua|Nicaragua" ;;
+        "costa rica") echo "America/Costa_Rica|Costa Rica" ;;
+        panama) echo "America/Panama|Panama" ;;
+        cuba) echo "America/Havana|Cuba" ;;
+        "dominican republic") echo "America/Santo_Domingo|Dominican Republic" ;;
+        colombia) echo "America/Bogota|Colombia" ;;
+        venezuela) echo "America/Caracas|Venezuela" ;;
+        ecuador) echo "America/Guayaquil|Ecuador" ;;
+        peru) echo "America/Lima|Peru" ;;
+        bolivia) echo "America/La_Paz|Bolivia" ;;
+        uruguay) echo "America/Montevideo|Uruguay" ;;
+        paraguay) echo "America/Asuncion|Paraguay" ;;
+        france) echo "Europe/Paris|France" ;;
+        germany|deutschland) echo "Europe/Berlin|Germany" ;;
+        italy|italia) echo "Europe/Rome|Italy" ;;
+        "united kingdom"|uk|england|britain|"great britain") echo "Europe/London|United Kingdom" ;;
+        ireland) echo "Europe/Dublin|Ireland" ;;
+        netherlands|holland) echo "Europe/Amsterdam|Netherlands" ;;
+        belgium) echo "Europe/Brussels|Belgium" ;;
+        luxembourg) echo "Europe/Luxembourg|Luxembourg" ;;
+        switzerland) echo "Europe/Zurich|Switzerland" ;;
+        austria) echo "Europe/Vienna|Austria" ;;
+        poland) echo "Europe/Warsaw|Poland" ;;
+        "czech republic"|czechia) echo "Europe/Prague|Czech Republic" ;;
+        slovakia) echo "Europe/Bratislava|Slovakia" ;;
+        hungary) echo "Europe/Budapest|Hungary" ;;
+        romania) echo "Europe/Bucharest|Romania" ;;
+        bulgaria) echo "Europe/Sofia|Bulgaria" ;;
+        greece) echo "Europe/Athens|Greece" ;;
+        turkey|turkiye) echo "Europe/Istanbul|Turkey" ;;
+        sweden) echo "Europe/Stockholm|Sweden" ;;
+        norway) echo "Europe/Oslo|Norway" ;;
+        denmark) echo "Europe/Copenhagen|Denmark" ;;
+        finland) echo "Europe/Helsinki|Finland" ;;
+        iceland) echo "Atlantic/Reykjavik|Iceland" ;;
+        ukraine) echo "Europe/Kiev|Ukraine" ;;
+        estonia) echo "Europe/Tallinn|Estonia" ;;
+        latvia) echo "Europe/Riga|Latvia" ;;
+        lithuania) echo "Europe/Vilnius|Lithuania" ;;
+        serbia) echo "Europe/Belgrade|Serbia" ;;
+        croatia) echo "Europe/Zagreb|Croatia" ;;
+        slovenia) echo "Europe/Ljubljana|Slovenia" ;;
+        israel) echo "Asia/Jerusalem|Israel" ;;
+        egypt) echo "Africa/Cairo|Egypt" ;;
+        morocco) echo "Africa/Casablanca|Morocco" ;;
+        algeria) echo "Africa/Algiers|Algeria" ;;
+        tunisia) echo "Africa/Tunis|Tunisia" ;;
+        "saudi arabia") echo "Asia/Riyadh|Saudi Arabia" ;;
+        "united arab emirates"|uae) echo "Asia/Dubai|UAE" ;;
+        qatar) echo "Asia/Qatar|Qatar" ;;
+        iran) echo "Asia/Tehran|Iran" ;;
+        iraq) echo "Asia/Baghdad|Iraq" ;;
+        pakistan) echo "Asia/Karachi|Pakistan" ;;
+        india) echo "Asia/Kolkata|India" ;;
+        bangladesh) echo "Asia/Dhaka|Bangladesh" ;;
+        "sri lanka") echo "Asia/Colombo|Sri Lanka" ;;
+        nepal) echo "Asia/Kathmandu|Nepal" ;;
+        china) echo "Asia/Shanghai|China" ;;
+        japan) echo "Asia/Tokyo|Japan" ;;
+        "south korea"|korea) echo "Asia/Seoul|South Korea" ;;
+        taiwan) echo "Asia/Taipei|Taiwan" ;;
+        "hong kong") echo "Asia/Hong_Kong|Hong Kong" ;;
+        singapore) echo "Asia/Singapore|Singapore" ;;
+        malaysia) echo "Asia/Kuala_Lumpur|Malaysia" ;;
+        thailand) echo "Asia/Bangkok|Thailand" ;;
+        vietnam) echo "Asia/Ho_Chi_Minh|Vietnam" ;;
+        philippines) echo "Asia/Manila|Philippines" ;;
+        "south africa") echo "Africa/Johannesburg|South Africa" ;;
+        nigeria) echo "Africa/Lagos|Nigeria" ;;
+        kenya) echo "Africa/Nairobi|Kenya" ;;
+        ethiopia) echo "Africa/Addis_Ababa|Ethiopia" ;;
+        ghana) echo "Africa/Accra|Ghana" ;;
+        tanzania) echo "Africa/Dar_es_Salaam|Tanzania" ;;
+        *)  # ¿es ya una zona IANA valida?
+            [ -e "$ZONEINFO/$1" ] && echo "$1|$1" ;;
+    esac
+}
+
+# ----------------------------------------------------------------- actions ---
+do_hostname() {
+    n="$1"
+    echo "$n" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$' || return 1
+    backup "$HOSTFILE"; echo "$n" > "$HOSTFILE"
+    [ -z "${GALILEOSETUP_ETC:-}" ] && hostname "$n" 2>/dev/null
+    return 0
+}
+
+do_password() {
+    if [ -n "${GALILEOSETUP_ETC:-}" ]; then
+        printf '%s\n' "$1" > "$ETC/.password-en-prueba"; chmod 600 "$ETC/.password-en-prueba" 2>/dev/null
+        return 0
+    fi
+    printf '%s\n' "root:$1" | chpasswd 2>/dev/null || return 1
+    return 0
+}
+
+do_timezone() {   # $1 = IANA zone (ya validada por el selector)
+    zone="$1"
+    [ -e "$ZONEINFO/$zone" ] || return 1
+    ensure_dir "$TZFILE"
+    echo "$zone" > "$TZFILE"
+    if [ -z "${GALILEOSETUP_ETC:-}" ]; then
+        rm -f "$LOCALTIME" 2>/dev/null
+        ln -s "$ZONEINFO/$zone" "$LOCALTIME" 2>/dev/null || cp -f "$ZONEINFO/$zone" "$LOCALTIME" 2>/dev/null
+    fi
+    TZ="$zone"; export TZ
+    return 0
+}
+
+do_wifi() {   # $1 ssid, $2 psk, $3 ip|dhcp
+    ensure_dir "$WPA"; backup "$WPA"
+    [ -f "$WPA" ] || printf 'ctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\n' > "$WPA"
+    _t="$WPA.new.$$"
+    wpa_passphrase "$1" "$2" | grep -v '^[[:space:]]*#psk=' > "$_t"
+    cat "$_t" >> "$WPA"; rm -f "$_t"; chmod 600 "$WPA" 2>/dev/null
+    if [ "${3:-dhcp}" = dhcp ] || [ -z "${3:-}" ]; then
+        set_iface wlan0 dhcp "" "" ""
+    else
+        set_iface wlan0 static "$3" "255.255.255.0" ""
+    fi
+    return 0
+}
+
+set_iface() {   # $1 iface, $2 dhcp|static, $3 ip, $4 subnet, $5 gw
+    iface="$1"; mode="$2"
+    ensure_dir "$IFACES"; [ -f "$IFACES" ] || : > "$IFACES"
+    tmp="$IFACES.new.$$"
+    awk -v I="$iface" '
+        $1=="auto" && $2==I {next}
+        $1=="iface" && $2==I {skip=1; next}
+        skip && /^[ \t]/ {next}
+        skip && NF==0 {skip=0; next}
+        skip {skip=0}
+        {print}
+    ' "$IFACES" > "$tmp"
+    {
+        echo ""
+        echo "auto $iface"
+        if [ "$mode" = "static" ]; then
+            echo "iface $iface inet static"
+            echo "	address $3"
+            [ -n "$4" ] && echo "	netmask $4"
+            [ -n "$5" ] && echo "	gateway $5"
+        else
+            echo "iface $iface inet dhcp"
+            if [ -d "/sys/class/net/$iface/wireless" ] || [ "$iface" = "wlan0" ]; then
+                echo "	pre-up wpa_supplicant -B -i $iface -c $WPA 2>/dev/null || true"
+                echo "	post-down killall wpa_supplicant 2>/dev/null || true"
+            fi
+        fi
+    } >> "$tmp"
+    mv "$tmp" "$IFACES"
+    # Aplicar YA: antes solo se aplicaba al reiniciar, y el usuario veia que
+    # configuraba una IP y la placa seguia con la anterior (reportado en placa).
+    if [ -z "${GALILEOSETUP_ETC:-}" ]; then
+        ifdown "$iface" >/dev/null 2>&1
+        ifup "$iface" >/dev/null 2>&1
+    fi
+}
+
+iface_list() {
+    for i in $(ls /sys/class/net 2>/dev/null); do
+        case "$i" in lo|sit0|tunl0|ip6tnl0) continue ;; esac
+        echo "$i"
+    done
+}
+
+show_status_text() {
+    printf 'kernel  : %s\n' "$(uname -r)"
+    printf 'host    : %s\n' "$(cat "$HOSTFILE" 2>/dev/null)"
+    printf 'uptime  : %ss\n' "$(cut -d. -f1 /proc/uptime 2>/dev/null)"
+    printf 'time    : %s\n' "$(date 2>/dev/null)"
+    printf 'timezone: %s\n' "$(cat "$TZFILE" 2>/dev/null || echo '(not set)')"
+    printf 'memory  : %s MB free\n' "$(free -m 2>/dev/null | awk '/^Mem:/{print $7}')"
+    echo
+    printf '%-8s %-10s %s\n' IFACE STATE ADDRESS
+    for i in $(iface_list); do
+        st=$(cat "/sys/class/net/$i/operstate" 2>/dev/null)
+        ad=$(ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4}' | tr '\n' ' ')
+        printf '%-8s %-10s %s\n' "$i" "${st:-?}" "${ad:-—}"
+    done
+    echo
+    echo "WiFi networks saved:"
+    if [ -r "$WPA" ]; then
+        grep -E 'ssid=' "$WPA" 2>/dev/null | sed 's/^[[:space:]]*/  /' || echo "  (none)"
+    else
+        echo "  (no wpa_supplicant.conf yet)"
+    fi
+}
+
+# -------------------------------------------------------------------- menus ---
+PICK=0
+# Repinta UNA fila de opcion en su sitio (estilo newt): asi moverse por el menu
+# manda ~160 bytes en vez de ~2 KB. A 115200 eso es la diferencia entre
+# respuesta instantanea y un barrido visible.
+repaint_item() {   # $1 indice ; $2 texto del item ; $3 hl|plain
+    # OJO: dentro de la funcion $1/$2 son SUS argumentos, no los del menu; el
+    # texto se pasa explicito (antes se hacia eval y pintaba el indice como texto).
+    _lbl=$(printf "    %d) %s" "$1" "$2")
+    printf "[%d;1H" "$((_base + $1 - 1))"     # _base ya es la fila de la opcion 1
+    if [ "$3" = hl ]; then
+        printf "###   |%s[7m%s%s[0m|   ###" "$ESC" "$(pad "$_lbl")" "$ESC"
+    else
+        printf "###   |%s|   ###" "$(pad "$_lbl")"
+    fi
+}
+
+# Repinta el titulo (se usa para el contador "12/23" al desplazar la lista).
+repaint_title() {
+    printf "\033[%d;1H" "$TITLE_ROW"
+    _padn=$(( (PAD - ${#1}) / 2 ))
+    _c=$(printf '%*s%s%*s' "$_padn" '' "$1" $(( PAD - _padn - ${#1} )) '')
+    printf "###   |%s|   ###" "$(pad "$_c")"
+}
+
+# Pinta una fila de la ventana visible.
+# $1 = fila visible (1..maxv) ; $2 = indice real ; $3 = texto ; $4 = hl|plain
+pinta_fila() {
+    printf "[%d;1H" "$((_base + $1 - 1))"
+    _lbl=$(printf "    %d) %s" "$2" "$3")
+    if [ "$4" = hl ]; then
+        printf "###   |%s[7m%s%s[0m|   ###" "$ESC" "$(pad "$_lbl")" "$ESC"
+    else
+        printf "###   |%s|   ###" "$(pad "$_lbl")"
+    fi
+}
+
+menu_pick() {   # $1 titulo ; resto = items -> PICK (0 = back/quit)
+    _titulo="$1"; shift
+    _n=$#
+    _sel=1
+    _top=1
+    setup_geom
+    # Alto FIJO: la lista se desplaza dentro del recuadro en vez de estirarlo.
+    # header gasta 11 filas y footer 5. Se deja UNA fila de margen: si el recuadro
+    # mide exactamente ROWS, el salto de linea final hace scroll y todas las
+    # coordenadas absolutas quedan corridas una fila (titulo y opcion 1 duplicados).
+    _maxv=$((ROWS - 17))
+    [ "$_maxv" -lt 3 ] && _maxv=3
+    [ "$_maxv" -gt "$_n" ] && _maxv=$_n
+    header "$_titulo"
+    _base=$((ROW + 1))
+    _i=1
+    while [ "$_i" -le "$_maxv" ]; do
+        eval "_txt=\${$_i}"
+        _lbl=$(printf "    %d) %s" "$_i" "$_txt")
+        if [ "$_i" = "$_sel" ]; then hilite "$_lbl"; else plain "$_lbl"; fi
+        _i=$((_i + 1))
+    done
+    footer
+    [ "$_n" -gt "$_maxv" ] && repaint_title "$_titulo  [$_sel/$_n]"
+    while :; do
+        case "$(read_key)" in
+            up)   if [ "$_sel" -le 1 ]; then _new=$_n; else _new=$((_sel - 1)); fi ;;
+            down) if [ "$_sel" -ge "$_n" ]; then _new=1; else _new=$((_sel + 1)); fi ;;
+            enter) PICK=$_sel; return 0 ;;
+            esc|q|quit|eof) PICK=0; return 0 ;;
+            *) continue ;;
+        esac
+        _old=$_sel; _sel=$_new
+        _oldtop=$_top
+        # mantener la seleccion dentro de la ventana
+        if [ "$_sel" -lt "$_top" ]; then _top=$_sel; fi
+        if [ "$_sel" -ge $((_top + _maxv)) ]; then _top=$((_sel - _maxv + 1)); fi
+        if [ "$_top" != "$_oldtop" ]; then
+            # se desplazo: repintar la ventana completa
+            _i=1
+            while [ "$_i" -le "$_maxv" ]; do
+                _abs=$((_top + _i - 1))
+                eval "_txt=\${$_abs}"
+                if [ "$_abs" = "$_sel" ]; then pinta_fila "$_i" "$_abs" "$_txt" hl
+                else pinta_fila "$_i" "$_abs" "$_txt" plain; fi
+                _i=$((_i + 1))
+            done
+            [ "$_n" -gt "$_maxv" ] && repaint_title "$_titulo  [$_sel/$_n]"
+        else
+            # sin desplazamiento: solo las dos filas afectadas
+            eval "_told=\${$_old}"; eval "_tnew=\${$_sel}"
+            pinta_fila "$((_old - _top + 1))" "$_old" "$_told" plain
+            pinta_fila "$((_sel - _top + 1))" "$_sel" "$_tnew" hl
+            [ "$_n" -gt "$_maxv" ] && repaint_title "$_titulo  [$_sel/$_n]"
+        fi
+    done
+}
+
+# ------------------------------------------------------------------ zonas ---
+CONTINENTS="Africa America Asia Atlantic Australia Europe Indian Pacific"
+
+countries_all() {
+    cat <<'EOF_PAISES'
+mexico
+guatemala
+belize
+honduras
+el salvador
+nicaragua
+costa rica
+panama
+cuba
+dominican republic
+colombia
+venezuela
+ecuador
+peru
+bolivia
+chile
+argentina
+uruguay
+paraguay
+brazil
+canada
+united states
+spain
+portugal
+france
+germany
+italy
+united kingdom
+ireland
+netherlands
+belgium
+luxembourg
+switzerland
+austria
+poland
+czech republic
+slovakia
+hungary
+romania
+bulgaria
+greece
+turkey
+sweden
+norway
+denmark
+finland
+iceland
+russia
+ukraine
+estonia
+latvia
+lithuania
+serbia
+croatia
+slovenia
+israel
+egypt
+morocco
+algeria
+tunisia
+saudi arabia
+united arab emirates
+qatar
+iran
+iraq
+pakistan
+india
+bangladesh
+sri lanka
+nepal
+china
+japan
+south korea
+taiwan
+hong kong
+singapore
+malaysia
+indonesia
+thailand
+vietnam
+philippines
+australia
+new zealand
+south africa
+nigeria
+kenya
+ethiopia
+ghana
+tanzania
+EOF_PAISES
+}
+
+nombre_pais() {
+    echo "$1" | tr "_" " " | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2); print}'
+}
+
+# Paises de un continente: se deriva del prefijo de su primera zona.
+countries_in_continent() {
+    # Lista estatica: derivarla en caliente costaba ~270 subprocesos y en el Quark
+    # tardaba segundos (el menu parecia no responder).
+    case "$1" in
+        Africa)
+            printf '%s
+' "Algeria" "Egypt" "Ethiopia" "Ghana" "Kenya" "Morocco" "Nigeria" \
+                          "South Africa" "Tanzania" "Tunisia" ;;
+        America)
+            printf '%s
+' "Argentina" "Belize" "Bolivia" "Brazil" "Canada" "Chile" "Colombia" \
+                          "Costa Rica" "Cuba" "Dominican Republic" "Ecuador" "El Salvador" \
+                          "Guatemala" "Honduras" "Mexico" "Nicaragua" "Panama" "Paraguay" "Peru" \
+                          "United States" "Uruguay" "Venezuela" ;;
+        Asia)
+            printf '%s
+' "Bangladesh" "China" "Hong Kong" "India" "Indonesia" "Iran" "Iraq" \
+                          "Israel" "Japan" "Malaysia" "Nepal" "Pakistan" "Philippines" "Qatar" \
+                          "Saudi Arabia" "Singapore" "South Korea" "Sri Lanka" "Taiwan" \
+                          "Thailand" "Turkey" "United Arab Emirates" "Vietnam" ;;
+        Atlantic)
+            printf '%s
+' "Iceland" ;;
+        Australia)
+            printf '%s
+' "Australia" ;;
+        Europe)
+            printf '%s
+' "Austria" "Belgium" "Bulgaria" "Croatia" "Czech Republic" "Denmark" \
+                          "Estonia" "Finland" "France" "Germany" "Greece" "Hungary" "Ireland" \
+                          "Italy" "Latvia" "Lithuania" "Luxembourg" "Netherlands" "Norway" \
+                          "Poland" "Portugal" "Romania" "Russia" "Serbia" "Slovakia" "Slovenia" \
+                          "Spain" "Sweden" "Switzerland" "Ukraine" "United Kingdom" ;;
+        Pacific)
+            printf '%s
+' "New Zealand" ;;
+        *) : ;;
+    esac
+}
+
+# Aplica la zona elegida (o la unica disponible).
+aplicar_zona() {
+    _z="$1"
+    if do_timezone "$_z"; then
+        message "Timezone set to $_z. Local time: $(date 2>/dev/null)"
+    else
+        message "Could not set the timezone to $_z."
+    fi
+}
+
+# Flujo en tres pasos: CONTINENTE -> PAIS -> ZONA
+screen_tz_country() {
+    set -- $CONTINENTS "Cancel"
+    menu_pick "SELECT CONTINENT" "$@"
+    [ "$PICK" -ge 1 ] || return 0
+    _ncont=$(echo $CONTINENTS | wc -w)
+    [ "$PICK" -gt "$_ncont" ] && return 0
+    _cont=$(echo $CONTINENTS | cut -d" " -f"$PICK")
+    _f="/tmp/gs-paises.$$"
+    countries_in_continent "$_cont" | sort > "$_f"
+    if [ ! -s "$_f" ]; then
+        message "No countries listed for $_cont."
+        rm -f "$_f"; return 0
+    fi
+    set --
+    while IFS= read -r _cc; do set -- "$@" "$_cc"; done < "$_f"
+    set -- "$@" "Cancel"
+    menu_pick "SELECT COUNTRY - $_cont" "$@"
+    _np=$(grep -c . "$_f")
+    if [ "$PICK" -ge 1 ] && [ "$PICK" -le "$_np" ]; then
+        _pais=$(sed -n "${PICK}p" "$_f")
+    else
+        rm -f "$_f"; return 0
+    fi
+    rm -f "$_f"
+    _fz="/tmp/gs-zonas.$$"
+    zones_for_country "$_pais" > "$_fz.raw" 2>/dev/null
+    : > "$_fz"
+    while IFS="|" read -r _z _lab; do
+        [ -z "$_z" ] && continue
+        [ -e "$ZONEINFO/$_z" ] && printf "%s|%s\n" "$_z" "$_lab" >> "$_fz"
+    done < "$_fz.raw"
+    rm -f "$_fz.raw"
+    _nz=$(grep -c . "$_fz" 2>/dev/null || echo 0)
+    if [ "$_nz" -eq 0 ]; then
+        message "No time zones installed for that country."
+    elif [ "$_nz" -eq 1 ]; then
+        aplicar_zona "$(cut -d"|" -f1 "$_fz")"
+    else
+        set --
+        while IFS="|" read -r _z _lab; do set -- "$@" "$_lab"; done < "$_fz"
+        set -- "$@" "Cancel"
+        menu_pick "SELECT TIME ZONE - $_pais" "$@"
+        if [ "$PICK" -ge 1 ] && [ "$PICK" -le "$_nz" ]; then
+            aplicar_zona "$(sed -n "${PICK}p" "$_fz" | cut -d"|" -f1)"
+        fi
+    fi
+    rm -f "$_fz"
+}
+
+# Elige la zona: si el pais tiene una sola, se aplica; si tiene varias, se elige.
+screen_tz_pick() {
+    _c="$1"
+    _f="/tmp/gs-tz.$$"
+    zones_for_country "$_c" > "$_f.raw" 2>/dev/null
+    : > "$_f"
+    while IFS='|' read -r _z _lab; do
+        [ -z "$_z" ] && continue
+        if [ -e "$ZONEINFO/$_z" ]; then printf '%s|%s\n' "$_z" "$_lab" >> "$_f"; fi
+    done < "$_f.raw"
+    rm -f "$_f.raw"
+    _n=$(grep -c . "$_f" 2>/dev/null || echo 0)
+    if [ "$_n" -eq 0 ]; then
+        message "Unknown country or zone: '$_c'. Try an English country name (Mexico, Spain...) or an IANA zone (America/Tijuana)."
+        rm -f "$_f"; return 0
+    fi
+    if [ "$_n" -eq 1 ]; then
+        _z=$(cut -d'|' -f1 "$_f")
+        if do_timezone "$_z"; then
+            message "Timezone set to $_z. Local time: $(date 2>/dev/null)"
+        else
+            message "Could not set the timezone to $_z."
+        fi
+        rm -f "$_f"; return 0
+    fi
+    set --
+    while IFS='|' read -r _z _lab; do set -- "$@" "$_lab"; done < "$_f"
+    set -- "$@" "Cancel"
+    menu_pick "SELECT TIME ZONE - $_c" "$@"
+    if [ "$PICK" -ge 1 ] && [ "$PICK" -le "$_n" ]; then
+        _z=$(sed -n "${PICK}p" "$_f" | cut -d'|' -f1)
+        if do_timezone "$_z"; then
+            message "Timezone set to $_z. Local time: $(date 2>/dev/null)"
+        else
+            message "Could not set the timezone to $_z."
+        fi
+    fi
+    rm -f "$_f"
+}
+
+# -------------------------------------------------------------------- forms ---
+# form_begin <titulo> "Label|value" "Label2|value2" ...
+FDIR="/tmp/gs-form.$$"
+FLBLS=""
+NFIELDS=0
+FTIT=""
+form_begin() {
+    FTIT="$1"; shift
+    rm -rf "$FDIR"; mkdir -p "$FDIR"
+    FLBLS=""
+    NFIELDS=0
+    for _pair in "$@"; do
+        FLBLS="$FLBLS${_pair%%|*}
+"
+        NFIELDS=$((NFIELDS + 1))
+        printf '%s\n' "${_pair#*|}" > "$FDIR/$NFIELDS"
+    done
+}
+
+label_n() { printf '%s\n' "$FLBLS" | sed -n "${1}p"; }
+value_n() { cat "$FDIR/$1" 2>/dev/null; }
+
+buttons_row() {   # 0 = sin foco | 1 = OK | 2 = CANCEL
+    if [ "$1" = 0 ]; then
+        _a="$(printf '%-32s' '             OK')"
+        _b="$(printf '%-33s' '            CANCEL')"
+    elif [ "$1" = 1 ]; then
+        _a="${ESC}[7m$(printf '%-32s' '             OK')${ESC}[0m"
+        _b="$(printf '%-33s' '            CANCEL')"
+    else
+        _a="$(printf '%-32s' '             OK')"
+        _b="${ESC}[7m$(printf '%-33s' '            CANCEL')${ESC}[0m"
+    fi
+    emit "###   |${_a}|${_b}|   ###"
+}
+
+form_draw() {   # redibuja con los valores actuales y el FOCO
+    header "$FTIT"
+    _i=1
+    while [ "$_i" -le "$NFIELDS" ]; do
+        _modo=plain
+        is_secret "$_i" && _modo=secret
+        if [ "$FOCUS" = "$_i" ]; then
+            field "$(label_n "$_i")" "$(value_n "$_i")" "$_modo" hl
+        else
+            field "$(label_n "$_i")" "$(value_n "$_i")" "$_modo"
+        fi
+        eval "FROW_$_i=$FIELD_ROW"
+        _i=$((_i + 1))
+    done
+    emit "###   |$(pad "")|   ###"
+    emit "###   $RULE   ###"
+    if [ "$FOCUS" -gt "$NFIELDS" ]; then buttons_row "$BTN"; else buttons_row 0; fi
+    emit "###   $RULE   ###"
+    emit "###$(printf "%$((W - 6))s" "")###"
+    emit "$FRAME"
+    printf "%-80s\n" "   up/down move | Enter edit/accept | Tab next | left/right buttons | Esc"
+}
+
+# read_secret -> REPLY : lee en modo crudo y muestra '*' por caracter.
+# No se usa stty -echo: usa TCSAFLUSH y descarta la entrada pendiente (medido:
+# el campo salia vacio y el script se quedaba esperando). Tampoco queda nada en
+# pantalla ni en el historial del terminal.
+# read_field -> REPLY : editor de linea minimo. Eco normal, Backspace borra,
+# TAB/Enter terminan, y las SECUENCIAS DE ESCAPE (flechas, etc.) se DESCARTAN:
+# con "read -r" en modo cocido se escribian como ^[[A dentro del campo.
+read_field() {
+    raw_on
+    _s="$1"
+    [ -n "$_s" ] && printf "%s" "$_s"
+    while :; do
+        read_byte
+        case "$BYTE_HEX" in
+            ""|0a|0d) break ;;
+            09) break ;;                        # TAB = terminar campo
+            03) REPLY=""; return 1 ;;          # Ctrl-C
+            7f|08)
+                if [ -n "$_s" ]; then
+                    _s=$(printf "%s" "$_s" | sed "s/.$//")
+                    printf "\b \b"
+                fi ;;
+            1b)
+                # consumir la secuencia completa hasta su terminador o 0.1 s
+                stty min 0 time 1 < "$TTY" 2>/dev/null
+                while :; do
+                    read_byte
+                    [ -z "$BYTE_HEX" ] && break
+                    case "$BYTE_HEX" in 41|42|43|44|48|46|7e|7d|7c) break ;; esac
+                done
+                stty min 1 time 0 < "$TTY" 2>/dev/null ;;
+            *)
+                # solo ASCII imprimible: evita que entren controles al campo
+                case "$BYTE_HEX" in
+                    2[0-9a-f]|3[0-9a-f]|4[0-9a-f]|5[0-9a-f]|6[0-9a-f]|7[0-9a-e])
+                        _ch=$(hex_to_char "$BYTE_HEX")
+                        _s="$_s$_ch"; printf "%s" "$_ch" ;;
+                esac ;;
+        esac
+    done
+    REPLY="$_s"
+    return 0
+}
+
+read_secret() {   # -> REPLY : lee en crudo, muestra * por caracter
+    raw_on
+    _s=""
+    while :; do
+        read_byte
+        case "$BYTE_HEX" in
+            ""|0a|0d) break ;;                  # EOF o Enter: fin
+            09)       break ;;                  # TAB: fin del campo (no se guarda)
+            03)       break ;;                  # Ctrl-C
+            7f|08)                              # Backspace
+                if [ -n "$_s" ]; then
+                    _s=$(printf '%s' "$_s" | sed 's/.$//')
+                    printf '\b \b'
+                fi ;;
+            1b)                                 # ESC y flechas: DESCARTAR la secuencia
+                stty min 0 time 1 < "$TTY" 2>/dev/null
+                while :; do
+                    read_byte
+                    [ -z "$BYTE_HEX" ] && break
+                    case "$BYTE_HEX" in 41|42|43|44|48|46|7e|7d|7c) break ;; esac
+                done
+                stty min 1 time 0 < "$TTY" 2>/dev/null ;;
+            *)
+                # solo ASCII imprimible (0x20-0x7e): nada de controles ni DEL
+                case "$BYTE_HEX" in
+                    2[0-9a-f]|3[0-9a-f]|4[0-9a-f]|5[0-9a-f]|6[0-9a-f]|7[0-9a-e])
+                        _s="$_s$(hex_to_char "$BYTE_HEX")"
+                        printf '*' ;;
+                esac ;;
+        esac
+    done
+    REPLY="$_s"
+}
+
+# edit_n <n> : puts the cursor on field n and reads a new value.
+# edit_n <n> : pone el cursor en el campo n y lee un valor nuevo.
+# En campos secretos NO se cambia el modo del terminal (ya estamos en crudo):
+# cada stty extra descartaria lo que el usuario ya tecleo.
+edit_n() {
+    eval "_r=\$FROW_$1"
+    if is_secret "$1"; then
+        printf "\033[%d;25H" "$_r"; printf "\033[K"
+        read_secret
+        _v="$REPLY"
+    else
+        printf "\033[%d;25H" "$_r"; printf "\033[K"
+        read_field "$(cat "$FDIR/$1" 2>/dev/null)"
+        _v="$REPLY"
+    fi
+    _v=$(printf "%s" "$_v" | tr -d "\000-\037\177" | sed "s/^ *//; s/ *$//")
+    [ -n "${GALILEOSETUP_DEBUG:-}" ] && printf "campo %s = [%s]\n" "$1" "$_v" >> "$GALILEOSETUP_DEBUG"
+    [ -n "$_v" ] && printf "%s\n" "$_v" > "$FDIR/$1"
+}
+
+# form_run -> FORM_RESULT=ok|cancel ; valores en value_n
+form_run() {   # -> FORM_RESULT=ok|cancel ; valores en value_n
+    form_begin "$@"
+    FORM_RESULT=cancel
+    FOCUS=1
+    BTN=1
+    form_draw
+    while :; do
+        case "$(read_key)" in
+            up)
+                if [ "$FOCUS" -gt 1 ] && [ "$FOCUS" -le "$NFIELDS" ]; then
+                    FOCUS=$((FOCUS - 1))
+                elif [ "$FOCUS" -gt "$NFIELDS" ]; then
+                    FOCUS=$NFIELDS
+                fi
+                form_draw ;;
+            down|tab)
+                # -le: desde el ULTIMO campo se baja a la fila de botones (NFIELDS+1)
+                if [ "$FOCUS" -le "$NFIELDS" ]; then FOCUS=$((FOCUS + 1)); fi
+                form_draw ;;
+            left)  if [ "$FOCUS" -gt "$NFIELDS" ]; then BTN=1; form_draw; fi ;;
+            right) if [ "$FOCUS" -gt "$NFIELDS" ]; then BTN=2; form_draw; fi ;;
+            enter)
+                if [ "$FOCUS" -le "$NFIELDS" ]; then
+                    edit_n "$FOCUS"
+                    form_draw
+                elif [ "$BTN" = 1 ]; then
+                    FORM_RESULT=ok; return 0
+                else
+                    FORM_RESULT=cancel; return 0
+                fi ;;
+            esc|q|quit|eof) FORM_RESULT=cancel; return 0 ;;
+        esac
+    done
+}
+
+is_secret() { case " ${GALILEOSETUP_SECRET_FIELDS:-} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# Mensaje de estado: se pinta en la ULTIMA fila (la del aviso de teclas), que es
+# la unica libre; antes escribia donde quedaba el cursor y se empalmaba sobre el
+# recuadro. Al terminar se restaura el aviso.
+message() {
+    _r=$ROWS
+    printf "[%d;1H[K" "$_r"
+    printf "  %s   (Enter)" "$1"
+    read_key >/dev/null 2>&1      # cualquier tecla; en crudo, sin stty (evita el flush)
+    printf "[%d;1H[K" "$_r"
+    case "$ART" in
+        none) printf "%-80s\n" "  up/down move | Enter select | q quit" ;;
+        *)    printf "%-80s\n" "   up/down move   |   Enter select   |   q quit" ;;
+    esac
+}
+
+# ------------------------------------------------------------------ screens ---
+screen_main() {
+    while :; do
+        menu_pick "MAIN MENU" "OS Settings" "Network configuration" "System status" "Reboot device" "Exit"
+        case "$PICK" in
+            1) screen_os ;;
+            2) screen_network ;;
+            3) screen_status ;;
+            4) do_reboot ;;
+            0|5) raw_restore; [ -t 1 ] && clear; exit 0 ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------- reiniciar ---
+do_reboot() {
+    menu_pick "REBOOT DEVICE" "No, go back" "Yes, reboot now"
+    case "$PICK" in
+        2)
+            raw_restore
+            [ -t 1 ] && clear
+            printf 'Rebooting now...\n'
+            sync
+            # 'reboot now' en una placa con watchdog: si el apagado ordenado no
+            # arranca en 5 s, se fuerza para no quedarse colgado.
+            ( sleep 5; reboot -f 2>/dev/null ) &
+            exec reboot now 2>/dev/null || exec reboot -f 2>/dev/null || exec reboot
+            ;;
+        *) : ;;   # volver al menu
+    esac
+}
+
+# ------------------------------------------------------------- fecha y hora ---
+do_datetime() {   # $1 = YYYY-MM-DD ; $2 = HH:MM[:SS]
+    case "$1" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) : ;;
+        *) return 1 ;;
+    esac
+    case "$2" in
+        [0-9][0-9]:[0-9][0-9]) _2="$2:00" ;;
+        [0-9][0-9]:[0-9][0-9]:[0-9][0-9]) _2="$2" ;;
+        *) return 1 ;;
+    esac
+    seg=$(echo "$1" | cut -d- -f1); mes=$(echo "$1" | cut -d- -f2); dia=$(echo "$1" | cut -d- -f3)
+    [ "$mes" -ge 1 ] && [ "$mes" -le 12 ] || return 1
+    [ "$dia" -ge 1 ] && [ "$dia" -le 31 ] || return 1
+    hh=$(echo "$_2" | cut -d: -f1); mm=$(echo "$_2" | cut -d: -f2); ss=$(echo "$_2" | cut -d: -f3)
+    [ "$hh" -le 23 ] && [ "$mm" -le 59 ] && [ "$ss" -le 59 ] || return 1
+    [ -f "$ETC/date.set" ] && backup "$ETC/date.set"
+    date -s "$1 $_2" >/dev/null 2>&1 || return 1
+    # dejar constancia y, si hay RTC, escribirlo
+    printf '%s %s\n' "$1" "$_2" > "$ETC/date.set" 2>/dev/null
+    [ -e /dev/rtc0 ] && hwclock -w >/dev/null 2>&1
+    return 0
+}
+
+do_ntp() {   # sincroniza por red; devuelve 0 si funciono
+    [ -f "$ETC/ntp.log" ] && backup "$ETC/ntp.log"
+    _ok=1
+    if command -v ntpd >/dev/null 2>&1; then
+        ntpd -q -n -p pool.ntp.org >"$ETC/ntp.log" 2>&1 && _ok=0
+    fi
+    if [ "$_ok" != 0 ] && command -v rdate >/dev/null 2>&1; then
+        rdate -s pool.ntp.org >>"$ETC/ntp.log" 2>&1 && _ok=0
+    fi
+    [ "$_ok" = 0 ] && [ -e /dev/rtc0 ] && hwclock -w >/dev/null 2>&1
+    return "$_ok"
+}
+
+# Formulario de fecha y hora, con los valores actuales precargados.
+screen_datetime() {
+    _hoy=$(date +%Y-%m-%d 2>/dev/null)
+    _ahora=$(date +%H:%M:%S 2>/dev/null)
+    GALILEOSETUP_SECRET_FIELDS=""
+    form_run "DATE AND TIME (YYYY-MM-DD HH:MM:SS)" "Date|$_hoy" "Time|$_ahora"
+    [ "$FORM_RESULT" = ok ] || return 0
+    _d=$(value_n 1); _t=$(value_n 2)
+    if do_datetime "$_d" "$_t"; then
+        message "Clock set to $(date 2>/dev/null)"
+    else
+        message "Invalid date or time. Use YYYY-MM-DD and HH:MM:SS."
+    fi
+}
+
+screen_ntp() {
+    if do_ntp; then
+        message "Clock synced from the network: $(date 2>/dev/null)"
+    else
+        message "Could not reach an NTP server. Check the network."
+    fi
+}
+
+screen_os() {
+    while :; do
+        menu_pick "OS SETTINGS" "Change Hostname" "Change Password" "Change Timezone" \
+            "Set Date and Time" "Sync Clock (NTP)" "Back"
+        case "$PICK" in
+            1) form_hostname ;;
+            2) form_password ;;
+            3) form_time ;;
+            4) screen_datetime ;;
+            5) screen_ntp ;;
+            0|6) return 0 ;;
+        esac
+    done
+}
+
+screen_status() {
+    header "SYSTEM STATUS"
+    show_status_text | while IFS= read -r _l; do
+        plain "$_l"
+    done
+    footer
+    read_key >/dev/null 2>&1     # cualquier tecla, sin Enter
+}
+
+screen_network() {
+    while :; do
+        menu_pick "NETWORK CONFIGURATION" "Wifi configuration" "Wired Network configuration" "Back"
+        case "$PICK" in
+            1) form_wifi ;;
+            2) screen_wired ;;
+            0|3) return 0 ;;
+        esac
+    done
+}
+
+screen_wired() {
+    _ifs=$(iface_list)
+    _n=$(printf '%s\n' "$_ifs" | grep -c .)
+    set -- $_ifs "Back"
+    menu_pick "WIRED NETWORK CONFIGURATION" "$@"
+    if [ "$PICK" -ge 1 ] && [ "$PICK" -le "$_n" ]; then
+        _if=$(printf '%s\n' "$_ifs" | sed -n "${PICK}p")
+        form_iface "$_if"
+    fi
+}
+
+# -------------------------------------------------------------------- forms ---
+form_hostname() {
+    _cur=$(cat "$HOSTFILE" 2>/dev/null)
+    GALILEOSETUP_SECRET_FIELDS=""
+    form_run "CHANGE HOSTNAME" "Host Name|$_cur"
+    [ "$FORM_RESULT" = ok ] || return 0
+    _v=$(value_n 1)
+    if [ -z "$_v" ]; then message "Empty hostname: nothing changed."; return 0; fi
+    if do_hostname "$_v"; then
+        message "Hostname set to '$_v'. Takes effect now and after reboot."
+    else
+        message "Invalid hostname. Use letters, digits and hyphens."
+    fi
+}
+
+form_password() {
+    GALILEOSETUP_SECRET_FIELDS="1 2"
+    form_run "CHANGE PASSWORD" "Password|" "Confirm|"
+    GALILEOSETUP_SECRET_FIELDS=""
+    [ "$FORM_RESULT" = ok ] || return 0
+    _p=$(value_n 1); _c=$(value_n 2)
+    if [ -z "$_p" ]; then message "Empty password: nothing changed."; return 0; fi
+    if [ "$_p" != "$_c" ]; then message "Passwords do not match. Nothing changed."; return 0; fi
+    if do_password "$_p"; then
+        message "Root password updated."
+    else
+        message "Could not set the password (chpasswd failed)."
+    fi
+}
+
+form_time() {
+    GALILEOSETUP_SECRET_FIELDS=""
+    screen_tz_country
+}
+
+form_wifi() {
+    GALILEOSETUP_SECRET_FIELDS="2"
+    form_run "WIFI CONFIGURATION" "SSID|" "PW|" "TYPE|WPA-PSK" "IP|dhcp"
+    GALILEOSETUP_SECRET_FIELDS=""
+    [ "$FORM_RESULT" = ok ] || return 0
+    _ssid=$(value_n 1); _psk=$(value_n 2); _ip=$(value_n 4)
+    if [ -z "$_ssid" ] || [ -z "$_psk" ]; then message "SSID and password are required."; return 0; fi
+    if do_wifi "$_ssid" "$_psk" "$_ip"; then
+        message "Network '$_ssid' saved to $WPA (passphrase hashed). Bring wlan0 up to apply."
+    else
+        message "Could not save the WiFi configuration (is wpa_passphrase installed?)."
+    fi
+}
+
+form_iface() {
+    _if="$1"
+    _cur=$(ip -4 -o addr show dev "$_if" 2>/dev/null | awk '{print $4}')
+    GALILEOSETUP_SECRET_FIELDS=""
+    _gwcur=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')
+    form_run "IFACE NETWORK CONFIGURATION" "IP|$_cur" "SUBNET|255.255.255.0" "GATEWAY|$_gwcur"
+    [ "$FORM_RESULT" = ok ] || return 0
+    _ip=$(value_n 1); _mask=$(value_n 2); _gw=$(value_n 3)
+    if [ "$_ip" = "dhcp" ]; then
+        backup "$IFACES"; set_iface "$_if" dhcp "" "" ""
+        message "Set $_if to DHCP in $IFACES."
+        return 0
+    fi
+    if ! ip_valid "${_ip%%/*}"; then message "Invalid IP address: '$_ip'"; return 0; fi
+    [ -n "$_gw" ] && ! ip_valid "$_gw" && { message "Invalid gateway: '$_gw'"; return 0; }
+    backup "$IFACES"; set_iface "$_if" static "${_ip%%/*}" "$_mask" "$_gw"
+    message "Configuration applied: $_if now uses the new settings."
+}
+
+# ---------------------------------------------------------------------- cli ---
+cli_status() { show_status_text; }
+
+cli_usage() {
+    sed -n '12,22p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    case "${1:-}" in
+        "") 
+            if [ ! -t 0 ] || [ ! -r "$TTY" ]; then
+                echo "galileosetup $VERSION — no terminal available."
+                echo "Use --help for the scriptable options."
+                return 1
+            fi
+            trap 'raw_restore' EXIT INT TERM HUP
+            raw_on
+            screen_main
+            raw_restore ;;
+        --status|-s) cli_status ;;
+        --version|-v) echo "galileosetup $VERSION" ;;
+        --hostname) shift; do_hostname "$1" && echo "hostname: $1" || { red "invalid hostname"; return 1; } ;;
+        --password) shift; do_password "$1" && echo "password updated" || { red "chpasswd failed"; return 1; } ;;
+        --tz-list) shift
+               zones_for_country "$1" | while IFS='|' read -r _z _lab; do
+                   [ -e "$ZONEINFO/$_z" ] && printf '%-32s %s\n' "$_z" "$_lab"
+               done ;;
+        --tz) shift
+               _z=$(zones_for_country "$1" | head -n 1 | cut -d'|' -f1)
+               [ -z "$_z" ] && { red "unknown country/zone: $1"; return 1; }
+               _nz=$(zones_for_country "$1" | grep -c .)
+               do_timezone "$_z" && echo "timezone: $(cat "$TZFILE")" || { red "could not set $_z"; return 1; }
+               [ "$_nz" -gt 1 ] && echo "(that country has $_nz zones; run --tz-list '$1' or use the menu to pick another)" ;;
+        --wifi) shift; [ $# -ge 2 ] || { red "usage: --wifi SSID PASSPHRASE"; return 1; }
+                do_wifi "$1" "$2" "${3:-dhcp}" && echo "wifi saved" ;;
+        --eth) shift
+               if [ "$1" = dhcp ]; then
+                   _i="${2:-eth0}"; backup "$IFACES"; set_iface "$_i" dhcp "" "" ""; echo "$_i -> dhcp"
+               else
+                   ip_valid "$1" || { red "invalid IP: $1"; return 1; }
+                   _i="${4:-eth0}"; backup "$IFACES"; set_iface "$_i" static "$1" "${2:-255.255.255.0}" "${3:-}"
+                   echo "$_i -> static $1"
+               fi ;;
+        --datetime) shift
+            _all="$1"
+            case "$_all" in
+                *" "*) _d="${_all%% *}"; _t="${_all#* }" ;;      # "fecha hora" junto
+                *)     _d="$_all"; _t="${2:-$(date +%H:%M:%S)}"; [ -n "$2" ] && shift ;;
+            esac
+            shift
+            if do_datetime "$_d" "$_t"; then echo "clock: $(date)"; else red "invalid date/time (use YYYY-MM-DD HH:MM[:SS])"; return 1; fi ;;
+        --ntp) if do_ntp; then echo "clock: $(date)"; else red "NTP failed (check the network)"; return 1; fi ;;
+        --serial) shift; switchmode "$1" && echo "serial: $1" || { red "switchmode failed"; return 1; } ;;
+        --help|-h) cli_usage ;;
+        *) red "unknown option: $1 (try --help)"; return 1 ;;
+    esac
+}
+
+main "$@"

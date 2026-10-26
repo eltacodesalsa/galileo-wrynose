@@ -1,0 +1,60 @@
+From: Jose <jose@localhost>
+Subject: [PATCH] ie6xx_wdt: handle a watchdog already locked by firmware
+
+On the SIMATIC IOT2000 / Galileo Gen 2 the firmware locks the IE6xx
+watchdog timer (WDTLR & WDT_LOCK), so stop() cannot disarm it.
+
+- return -EBUSY instead of -1 when the timer is locked
+- set WDOG_HW_RUNNING and nowayout *before* watchdog_register_device()
+  so the core starts feeding the timer before userspace opens it
+
+Upstream-Status: Inappropriate [platform specific]
+Signed-off-by: Jose <jose@localhost>
+---
+--- a/drivers/watchdog/ie6xx_wdt.c
++++ b/drivers/watchdog/ie6xx_wdt.c
+@@ -143,8 +143,9 @@
+ 
+ static int ie6xx_wdt_stop(struct watchdog_device *wdd)
+ {
++	/* Con WDT_LOCK el firmware no permite pararlo: errno idiomatico. */
+ 	if (inb(ie6xx_wdt_data.sch_wdtba + WDTLR) & WDT_LOCK)
+-		return -1;
++		return -EBUSY;
+ 
+ 	/* Disable the watchdog timer */
+ 	spin_lock(&ie6xx_wdt_data.unlock_sequence);
+@@ -241,7 +242,6 @@
+ 	dev_dbg(&pdev->dev, "WDT = 0x%X\n", ie6xx_wdt_data.sch_wdtba);
+ 
+ 	ie6xx_wdt_dev.timeout = timeout;
+-	watchdog_set_nowayout(&ie6xx_wdt_dev, nowayout);
+ 	ie6xx_wdt_dev.parent = &pdev->dev;
+ 
+ 	spin_lock_init(&ie6xx_wdt_data.unlock_sequence);
+@@ -251,6 +251,25 @@
+ 		dev_warn(&pdev->dev,
+ 			"Watchdog Timer is Locked (Reg=0x%x)\n", wdtlr);
+ 
++	/*
++	 * Marcelino, 2026-10-22: en esta placa el firmware UEFI arma el watchdog a
++	 * 60 s y lo deja bloqueado. Dos condiciones INDEPENDIENTES:
++	 *  - WDT_ENABLE -> el hardware ya corre: hay que decírselo al core
++	 *    (WDOG_HW_RUNNING) para que lo alimente durante el arranque, hasta que
++	 *    userspace abra /dev/watchdog.
++	 *  - WDT_LOCK   -> no se puede parar: nowayout POR DISPOSITIVO, así no
++	 *    depende de que alguien conserve el CONFIG correcto.
++	 * Las dos ANTES de watchdog_register_device(), porque el core decide ahí si
++	 * arranca su handler pre-userspace.
++	 */
++	if (wdtlr & WDT_ENABLE) {
++		set_bit(WDOG_HW_RUNNING, &ie6xx_wdt_dev.status);
++		dev_info(&pdev->dev,
++			 "watchdog ya en marcha (WDTLR=0x%x); el core lo alimenta hasta que userspace lo abra\n",
++			 wdtlr);
++	}
++	watchdog_set_nowayout(&ie6xx_wdt_dev, nowayout || (wdtlr & WDT_LOCK));
++
+ 	ie6xx_wdt_debugfs_init();
+ 
+ 	ret = watchdog_register_device(&ie6xx_wdt_dev);

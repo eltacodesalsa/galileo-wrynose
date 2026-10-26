@@ -1,0 +1,54 @@
+#!/bin/sh
+# Compuerta obligatoria antes de cada push.
+# Falla el push si el saneador encuentra un solo dato sensible, si hay un archivo
+# que no debe viajar, o si el arbol supera el limite de tamano.
+#
+# set -e + comprobacion EXPLICITA del codigo de salida: el fallo original fue
+# encadenar la compuerta con un pipe, donde el estado que se propaga es el del
+# ultimo comando (`tail`), no el de la compuerta.
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+fallos=0
+
+echo "-- saneador de datos sensibles"
+if ! ./scripts/sanear-datos-sensibles.py --check . > /tmp/pre-push-sanear.$$ 2>&1; then
+    cat /tmp/pre-push-sanear.$$
+    echo "RECHAZADO: datos sensibles en el arbol."
+    fallos=$((fallos + 1))
+fi
+rm -f /tmp/pre-push-sanear.$$
+
+echo "-- formas de secreto"
+if grep -rInE "(BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})" . \
+        --exclude-dir=.git --exclude-dir=node_modules 2>/dev/null | head -5 | grep -q .; then
+    echo "RECHAZADO: hay algo con forma de secreto."
+    fallos=$((fallos + 1))
+fi
+
+echo "-- archivos que no deben viajar"
+if git ls-files | grep -E "\.(wic|wic\.bz2|img|swu|ext4)$|\.log$|credenciales|(^|/)id_(rsa|ed25519|ecdsa)$|\.env$" | head -3 | grep -q .; then
+    echo "RECHAZADO: hay artefactos o ficheros privados versionados."
+    fallos=$((fallos + 1))
+fi
+
+echo "-- llave SSH horneada en la imagen"
+if git ls-files | grep -qE "galileo-ssh-key/files/authorized_keys$"; then
+    echo "RECHAZADO: la receta de la imagen lleva una llave real (ver NOTICE/SECURITY)."
+    fallos=$((fallos + 1))
+fi
+
+echo "-- tamano maximo de archivo (5 MB)"
+if git ls-files -z | xargs -0 -r du -k 2>/dev/null | awk '$1 > 5120 {print; found=1} END {exit !found}'; then
+    echo "RECHAZADO: hay archivos de mas de 5 MB."
+    fallos=$((fallos + 1))
+fi
+
+if [ "$fallos" -ne 0 ]; then
+    echo ""
+    echo "$fallos compuerta(s) en rojo. Push abortado."
+    exit 1
+fi
+echo "todas las compuertas en verde."

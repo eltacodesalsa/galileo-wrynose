@@ -1,0 +1,10 @@
+# artefactos de ejecucion
+*.log
+*.bak-*
+*.wic
+*.wic.bz2
+*.zst
+
+# salidas de bitbake
+build/
+tmp/

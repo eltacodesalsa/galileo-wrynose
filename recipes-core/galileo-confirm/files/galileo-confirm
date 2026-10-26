@@ -1,0 +1,33 @@
+#!/bin/sh
+# Confirma el arranque ante EFI Boot Guard SOLO si el sistema esta sano.
+# Medido en la placa: si nadie confirma, al siguiente reinicio EBG marca el
+# entorno como FAILED (ustate 3, revision 0) y vuelve al anterior. Por eso este
+# script no revierte nada: solo confirma, o no hace nada y deja que el watchdog
+# y el firmware hagan el rollback.
+set -u
+
+case "$(cat /proc/cmdline)" in
+    *platform0*) P=0 ;;
+    *platform1*) P=1 ;;
+    *) exit 0 ;;                    # no sabemos que entorno es: no tocar
+esac
+
+# Solo si el entorno esta EN PRUEBAS (ustate 2). Si ya esta OK, nada que hacer.
+ST=$(bg_printenv -p $P 2>/dev/null | awk '/ustate/ {gsub(/[^0-9]/,""); print; exit}')
+[ "${ST:-}" = "2" ] || exit 0
+
+# Comprobaciones de salud. Si alguna falla, NO se confirma y el firmware revierte.
+EST=$(systemctl is-system-running 2>/dev/null || true)
+case "$EST" in
+    running|degraded) : ;;
+    *) logger -t galileo-confirm "no confirmo: sistema $EST"; exit 1 ;;
+esac
+systemctl is-active --quiet galileo-network || { logger -t galileo-confirm "no confirmo: red"; exit 1; }
+ip -4 addr show eth0 2>/dev/null | grep -q "inet " || { logger -t galileo-confirm "no confirmo: eth0 sin IP"; exit 1; }
+
+if bg_setenv -p $P -s 0 >/dev/null 2>&1; then
+    logger -t galileo-confirm "arranque CONFIRMADO (entorno $P, ustate -> 0)"
+else
+    logger -t galileo-confirm "fallo al confirmar el entorno $P"
+    exit 1
+fi

@@ -1,0 +1,13 @@
+galileo-confirm
+==============
+
+EFI Boot Guard arranca un entorno actualizado en estado TESTING (ustate=2). Si
+nadie lo confirma, al siguiente reinicio lo marca FAILED y vuelve al anterior:
+ese comportamiento esta medido en la placa (ronda 7, compuerta 5).
+
+Este servicio corre una vez por arranque y llama "bg_setenv -p N -s 0" solo si:
+  - el entorno esta en TESTING,
+  - systemd llega a running/degraded,
+  - galileo-network esta activo y eth0 tiene IPv4.
+Si algo falla, no confirma y el firmware revierte solo. No escribe ni restaura
+nada por su cuenta.

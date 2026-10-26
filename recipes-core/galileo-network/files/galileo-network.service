@@ -1,0 +1,16 @@
+[Unit]
+Description=Configuracion de red por ifupdown (/etc/network/interfaces)
+Documentation=man:interfaces(5)
+After=local-fs.target
+Before=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/ifup -a
+ExecStop=/sbin/ifdown -a
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

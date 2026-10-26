@@ -1,0 +1,5 @@
+# Galileo: la red la gobierna ifupdown, no systemd-networkd.
+disable systemd-networkd.service
+disable systemd-networkd.socket
+disable systemd-networkd-wait-online.service
+enable galileo-network.service
