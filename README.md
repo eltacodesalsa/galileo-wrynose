@@ -1,10 +1,4 @@
-# galileoWrynose
-
-
-  
-<img width="960" height="123" alt="galileo-removebg-preview" src="https://github.com/user-attachments/assets/e72aa83f-9d4a-49b5-8019-8f9dbc9b616a" />
-
-
+# galileo-wrynose
 
 A current Yocto image for the **Intel Galileo Gen 2** (Intel Quark X1000),
 built on **Yocto 6.0.4 "wrynose"** with a real A/B boot chain.
@@ -22,7 +16,7 @@ ACPI tables); it is a technical identifier, not the identity of the board.
 > from. Not produced, endorsed or supported by either company. Details and
 > per-component credits in `NOTICE.md`.
 
-## Status: 0.1 — A/B-ready, OTA not included
+## Status: 0.1 — A/B-ready
 
 | Capability | State |
 |---|---|
@@ -31,7 +25,6 @@ ACPI tables); it is a technical identifier, not the identity of the board.
 | Automatic rollback (unconfirmed update reverts) | ✅ verified on hardware |
 | Watchdog fed, survives >15 min | ✅ |
 | Setup utility (`galileosetup`) | ✅ |
-| **OTA (`swupdate`)** | ❌ binary installed but **built without `CONFIG_BOOTLOADER_EBG`** — see `RELEASE-CHECKLIST.md` |
 
 ## Hardware
 
@@ -58,22 +51,7 @@ ACPI tables); it is a technical identifier, not the identity of the board.
 Kernel 6.18.52, compiled with `-Wa,-momit-lock-prefix=yes` (Quark `LOCK` errata):
 `objdump` reports **0** `lock` instructions in `vmlinux` and in all 588 modules.
 
-## First boot
-
-> ### 🔑 Initial credentials
-> ```text
-> user:      root
-> password:  galileo
-> ```
-> The password is **expired on first login**: the system forces you to choose a new
-> one immediately, and `galileo` stops working after that. Do it before connecting
-> the board to any network you do not control.
->
-> Prefer no password at all? Put `galileo-keys.txt` (one public key per line) in the
-> FAT boot partition before the first boot — SSH then accepts keys only and the file
-> is deleted. Same partition, `galileo-password.txt`, if you want your own password
-> without typing it on the console.
-
+## First boot & Provisioning
 
 ```
 EFI Boot Guard v0.22
@@ -84,35 +62,24 @@ Galileo Wrynose 6.0.4
 galileo login:
 ```
 
-* **Console (root, no password):** `root` — PAM `nullok_secure` allows an empty
-  password on the local serial console only.
-* **Network:** `eth0` defaults to **192.168.200.1/24** static (same convention as
-  Siemens' image), so the board is always reachable with a direct cable.
-  Change it with `galileosetup → Network configuration`.
-* **SSH:** enabled with password. The initial credential is **root / galileo**
-  and it is **expired on first login**, so the system forces you to set your own
-  password immediately. `galileo` then stops working.
+- **Console & Network Defaults:** 
+  - Local serial console (`ttyS1`) allows an empty password via PAM `nullok_secure` for `root`.
+  - Network interface `eth0` defaults to **192.168.200.1/24** static (matching Siemens' convention) for immediate out-of-the-box cable connection.
+- **Credentials & Expiration:**
+  - Default user/password: `root` / `galileo`.
+  - **The password expires on first login**, forcing you to choose a new one immediately. Once changed, `galileo` stops working.
 
-  ```text
-  ⚠️  Change it: the first thing to do after logging in is  passwd
-  ```
-
-  Prefer keys, or want a different password from the start? Put one of these
-  files in the **FAT boot partition** (the one your PC shows as a removable
-  drive) before the first boot:
-
-  | File | Effect |
-  |---|---|
-  | `galileo-password.txt` | sets that password for root and enables SSH password login; the file is deleted afterwards |
-  | `galileo-keys.txt` | installs one public key per line, disables SSH password login; the file is deleted afterwards |
-
-  With neither file, the default `root`/`galileo` applies and expires on first
-  use.
+> ⚠️ **Zero-touch provisioning (Optional):**
+> Prefer keys or a custom password from the start without typing on the console? Place one of these files in the **FAT boot partition** (accessible as a removable drive from your PC) before booting for the first time:
+> 
+> | File | Effect |
+> |---|---|
+> | `galileo-password.txt` | Sets that password for root and enables SSH password login; the file is deleted automatically afterwards. |
+> | `galileo-keys.txt` | Installs one public key per line and disables SSH password login; the file is deleted automatically afterwards. |
 
 ## Setting it up: `galileosetup`
 
-A menu-driven tool on the board, written in POSIX shell with no dependencies — no
-Python, no `mraa`, no `snack`. Run it from the serial console or over SSH:
+A menu-driven tool on the board, written in POSIX shell with no dependencies — no Python, no `mraa`, no `snack`. Run it from the serial console or over SSH:
 
 ```sh
 galileosetup
@@ -128,34 +95,26 @@ galileosetup
 | **Show status** | kernel, uptime, addresses, disk, watchdog, loaded modules |
 | **Hardware test** | runs `hw-smoke.sh` and prints PASS/FAIL/SKIP per subsystem |
 
-It reads and writes plain configuration files (`/etc/hostname`,
-`/etc/network/interfaces`, `/etc/wpa_supplicant.conf`), so anything it does can also
-be done by hand — it is a convenience, not a daemon, and nothing depends on it at
-boot. The banner adapts to an 8-line art layout on 90+ column terminals and to a
-3-line compact one on an 80×24 console.
+It reads and writes plain configuration files (`/etc/hostname`, `/etc/network/interfaces`, `/etc/wpa_supplicant.conf`), so anything it does can also be done by hand — it is a convenience, not a daemon, and nothing depends on it at boot.
 
 ## A/B semantics (measured, not assumed)
 
-```
-bg_setenv -p 1 -r 3 -s 1 ; reboot     # as an update would leave it
-  -> boots root=PARTLABEL=platform1, ustate 2 (TESTING)
+```bash
+bg_setenv -p 1 -r 3 -s 1 ; reboot      # as an update would leave it
+# -> boots root=PARTLABEL=platform1, ustate 2 (TESTING)
 reboot without confirming
-  -> boots root=PARTLABEL=platform0; boot1 becomes revision 0, ustate 3 (FAILED)
+# -> boots root=PARTLABEL=platform0; boot1 becomes revision 0, ustate 3 (FAILED)
 ```
 
-`galileo-confirm.service` runs once per boot and sets `ustate=0` **only if** the
-system reached `running`/`degraded`, `galileo-network` is active and `eth0` has an
-IPv4 address. If anything fails it does not confirm, and EFI Boot Guard reverts
-by itself on the next boot.
+`galileo-confirm.service` runs once per boot and sets `ustate=0` **only if** the system reached `running`/`degraded`, `galileo-network` is active and `eth0` has an IPv4 address. If anything fails it does not confirm, and EFI Boot Guard reverts by itself on the next boot.
 
 ## Building
 
-`poky` no longer exists as a combined repository in 6.0; the tree is assembled
-from three repositories plus the layers:
+`poky` no longer exists as a combined repository in 6.0; the tree is assembled from three repositories plus the layers:
 
 ```
 yocto-wrynose/
-  oecore/  bitbake/  meta-yocto/         # Yocto 6.0.4
+  oecore/  bitbake/  meta-yocto/            # Yocto 6.0.4
   meta-openembedded/                     # meta-oe, meta-python
   meta-efibootguard/                     # patched: per-partition kernel args
   meta-swupdate/
@@ -168,26 +127,14 @@ source oecore/oe-init-build-env build     # must NOT be piped: it sets BBPATH
 MACHINE=iot2000 bitbake galileo-image
 ```
 
-Requirements: `meta-openembedded` (meta-oe, meta-python), `meta-efibootguard`
-branch `wrynose`, `meta-swupdate`. The patch to `meta-efibootguard` is in
-`patches/efibootguard-boot-args-por-particion.patch` — it makes `args` define only
-the root and keep the rest of the kernel command line (needed because
-`console=ttyS1,115200n8` cannot pass through `--sourceparams`, which splits on
-commas).
+Requirements: `meta-openembedded` (meta-oe, meta-python), `meta-efibootguard` branch `wrynose`, `meta-swupdate`. The patch to `meta-efibootguard` is in `patches/efibootguard-boot-args-por-particion.patch` — it makes `args` define only the root and keep the rest of the kernel command line (needed because `console=ttyS1,115200n8` cannot pass through `--sourceparams`, which splits on commas).
 
 ## Image contents
 
 Base: systemd 259, `ifupdown` (networkd is masked), busybox.
-Added for this board: `galileosetup`, `hw-smoke.sh`, `galileo-watchdog`,
-`galileo-network`, `galileo-confirm`, `efibootguard-tools`, `net-tools`,
-`iproute2`, `nano`, `less`, `bash`, `curl`, `jq`, `wget`, `ethtool`, `iw`,
-`wireless-regdb`, `i2c-tools`, `can-utils`, `usbutils`, `pciutils`, `alsa-utils`,
-`procps`, `psmisc`, `file`, `e2fsprogs`, `dosfstools`, `parted`, `sudo`,
-`openssl-bin`, `screen`, `swupdate`.
+Added for this board: `galileosetup`, `hw-smoke.sh`, `galileo-watchdog`, `galileo-network`, `galileo-confirm`, `efibootguard-tools`, `net-tools`, `iproute2`, `nano`, `less`, `bash`, `curl`, `jq`, `wget`, `ethtool`, `iw`, `wireless-regdb`, `i2c-tools`, `can-utils`, `usbutils`, `pciutils`, `alsa-utils`, `procps`, `psmisc`, `file`, `e2fsprogs`, `dosfstools`, `parted`, `sudo`, `openssl-bin`, `screen`, `swupdate`.
 
-Only one firmware file is shipped (`linux-firmware-iwlwifi-6000g2b-6`, for the
-on-board Centrino 6235). That single change took the root filesystem from 1.8 GB
-to **184 MB**.
+Only one firmware file is shipped (`linux-firmware-iwlwifi-6000g2b-6`, for the on-board Centrino 6235). That single change took the root filesystem from 1.8 GB to **184 MB**.
 
 ## Documentation
 
@@ -205,6 +152,4 @@ to **184 MB**.
 
 ## License
 
-The layer is MIT. Derived work keeps the licenses of `meta-iot2000` (Siemens),
-`meta-efibootguard`, `meta-swupdate` and OpenEmbedded/Yocto. No code from Intel or
-Siemens is redistributed as if it were original.
+The layer is MIT. Derived work keeps the licenses of `meta-iot2000` (Siemens), `meta-efibootguard`, `meta-swupdate` and OpenEmbedded/Yocto. No code from Intel or Siemens is redistributed as if it were original.
