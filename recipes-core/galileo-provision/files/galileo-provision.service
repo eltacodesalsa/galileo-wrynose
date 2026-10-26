@@ -1,0 +1,17 @@
+[Unit]
+Description=Provision SSH credentials from the boot partition on first boot
+Documentation=file:///usr/share/doc/galileo-provision/README
+DefaultDependencies=no
+After=local-fs.target
+Before=sshd.service sshdgenkeys.service
+ConditionPathExists=!/var/lib/galileo-provision.done
+ConditionPathExists=/dev/mmcblk0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/galileo-provision
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

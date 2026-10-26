@@ -1,0 +1,68 @@
+#!/bin/sh
+# Provision de credenciales en el primer arranque, leyendo la particion FAT que
+# el usuario ya puede abrir desde Windows o macOS con un lector de SD.
+#
+#   galileo-keys.txt      -> una llave publica por linea; SSH solo con llave
+#   galileo-password.txt  -> una contrasena; SSH con contrasena para root
+#
+# El archivo se BORRA despues de aplicarlo. Si no hay ninguno, no se toca nada y
+# SSH sigue cerrado: no existe ninguna credencial por defecto.
+set -u
+BOOT=/run/galileo-provision
+LOG="logger -t galileo-provision"
+
+mkdir -p "$BOOT"
+DEV=$(blkid -L efi 2>/dev/null || true)
+[ -z "$DEV" ] && DEV=/dev/mmcblk0p1
+if ! mount "$DEV" "$BOOT" 2>/dev/null; then
+    $LOG "no pude montar $DEV; nada que hacer"
+    exit 0
+fi
+
+KEYS="$BOOT/galileo-keys.txt"
+PWF="$BOOT/galileo-password.txt"
+aplicado=0
+
+if [ -s "$KEYS" ]; then
+    install -d -m 0700 /root/.ssh
+    # solo lineas que parezcan llaves
+    grep -E '^(ssh-|ecdsa-|sk-)' "$KEYS" > /root/.ssh/authorized_keys 2>/dev/null || : > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    n=$(wc -l < /root/.ssh/authorized_keys)
+    if [ "$n" -gt 0 ]; then
+        $LOG "instaladas $n llave(s) desde la particion efi"
+        aplicado=1
+    else
+        $LOG "galileo-keys.txt sin llaves validas; ignorado"
+    fi
+    rm -f "$KEYS"
+elif [ -s "$PWF" ]; then
+    # primera linea, sin espacios ni retorno
+    pw=$(head -n 1 "$PWF" | tr -d '\r\n' | sed 's/[[:space:]]*$//')
+    if [ -n "$pw" ]; then
+        printf 'root:%s\n' "$pw" | chpasswd 2>/dev/null && {
+            install -d -m 0755 /etc/ssh/sshd_config.d
+            printf '%s\n' \
+              '# Generado por galileo-provision: el usuario definio contrasena en el' \
+              '# primer arranque. SSH con contrasena para root.' \
+              'PasswordAuthentication yes' \
+              > /etc/ssh/sshd_config.d/20-provision.conf
+            chmod 600 /etc/ssh/sshd_config.d/20-provision.conf
+            $LOG "contrasena de root definida desde la particion efi; SSH con contrasena habilitado"
+            aplicado=1
+        } || $LOG "no pude aplicar la contrasena"
+    fi
+    rm -f "$PWF"
+fi
+
+sync
+unmount_ok=0
+umount "$BOOT" 2>/dev/null && unmount_ok=1
+[ "$unmount_ok" = 0 ] && umount -l "$BOOT" 2>/dev/null
+
+if [ "$aplicado" = 1 ]; then
+    mkdir -p /var/lib
+    touch /var/lib/galileo-provision.done
+    [ -f /etc/ssh/sshd_config.d/20-provision.conf ] && systemctl restart sshd 2>/dev/null
+fi
+exit 0

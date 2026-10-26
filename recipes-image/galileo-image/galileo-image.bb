@@ -126,3 +126,26 @@ IMAGE_INSTALL:append = " galileo-serial-console"
 IMAGE_FEATURES:remove = "allow-root-login allow-empty-password"
 # Los artefactos publicados deben decir galileo, no iot2000 (el MACHINE no cambia).
 IMAGE_BASENAME = "galileo-wrynose"
+# Provision de credenciales en el primer arranque desde la particion FAT: el
+# usuario pone galileo-password.txt o galileo-keys.txt en la SD y SSH queda
+# habilitado sin consola serie. Sin archivo, la imagen no tiene credenciales.
+IMAGE_INSTALL:append = " galileo-provision"
+
+# --- Contrasena inicial root/galileo, expirada al primer uso -----------------
+# ROOTFS_POSTPROCESS_COMMAND es una variable de la receta de la IMAGEN: puesta en
+# la receta de un paquete no se ejecuta nunca (medido: el hash quedaba vacio y la
+# expiracion sin marcar). El hash se lee de un archivo porque escrito en metadata
+# los '$' se pierden en el escapado de bitbake.
+SRC_URI += "file://root_hash"
+
+galileo_set_root_pw() {
+    H=$(cat ${THISDIR}/files/root_hash)
+    [ -n "$H" ] || bbfatal "root_hash vacio: la imagen quedaria sin contrasena"
+    sed -i "s|^root:[^:]*:|root:${H}:|" ${IMAGE_ROOTFS}/etc/shadow
+    # campo 3 = ultimo cambio en dias; 0 equivale a `chage -d 0` (expirada)
+    sed -i 's/^root:\([^:]*\):[0-9]*:/root:\1:0:/' ${IMAGE_ROOTFS}/etc/shadow
+    # comprobacion con awk: evita el infierno de escapado de '$6$' en el shell
+    awk -F: '$1=="root" && substr($2,1,3)=="$6$" && length($2)>50 {ok=1} END{exit !ok}' \
+        ${IMAGE_ROOTFS}/etc/shadow || bbfatal "el hash no quedo escrito en /etc/shadow"
+}
+ROOTFS_POSTPROCESS_COMMAND += "galileo_set_root_pw; "

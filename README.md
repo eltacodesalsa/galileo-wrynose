@@ -68,20 +68,25 @@ galileo login:
 * **Network:** `eth0` defaults to **192.168.200.1/24** static (same convention as
   Siemens' image), so the board is always reachable with a direct cable.
   Change it with `galileosetup → Network configuration`.
-* **SSH:** root login **by public key only** (`prohibit-password`), and the
-  published image ships **no key at all** — a freshly flashed board has no remote
-  access until you provision your own key from the serial console:
+* **SSH:** enabled with password. The initial credential is **root / galileo**
+  and it is **expired on first login**, so the system forces you to set your own
+  password immediately. `galileo` then stops working.
 
-  ```sh
-  # on the serial console, as root
-  mkdir -p /root/.ssh && chmod 700 /root/.ssh
-  echo "ssh-ed25519 AAAA...your-key user@host" >> /root/.ssh/authorized_keys
-  chmod 600 /root/.ssh/authorized_keys
+  ```text
+  ⚠️  Change it: the first thing to do after logging in is  passwd
   ```
 
-  Baking an administrator key into a distributed image would hand root access
-  over every board running it, so the build only installs one when you set
-  `GALILEO_ADMIN_KEY` in a local, unversioned `local.conf`.
+  Prefer keys, or want a different password from the start? Put one of these
+  files in the **FAT boot partition** (the one your PC shows as a removable
+  drive) before the first boot:
+
+  | File | Effect |
+  |---|---|
+  | `galileo-password.txt` | sets that password for root and enables SSH password login; the file is deleted afterwards |
+  | `galileo-keys.txt` | installs one public key per line, disables SSH password login; the file is deleted afterwards |
+
+  With neither file, the default `root`/`galileo` applies and expires on first
+  use.
 
 ## A/B semantics (measured, not assumed)
 

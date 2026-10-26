@@ -1,0 +1,20 @@
+galileo-provision
+=================
+
+En el primer arranque, instala credenciales SSH leyendo la particion FAT `efi`,
+que el usuario puede abrir desde Windows o macOS con un lector de SD.
+
+Dos caminos, el usuario elige uno:
+
+1) Contrasena (para quien no usa Linux)
+   Crear en la particion FAT un archivo de texto llamado `galileo-password.txt`
+   cuya primera linea sea la contrasena deseada. Al arrancar, se fija como
+   contrasena de root, se habilita SSH con contrasena y el archivo se borra.
+
+2) Llave publica (recomendado si se sabe)
+   Crear `galileo-keys.txt` con una llave publica por linea. SSH queda solo con
+   llave y no se habilita contrasena.
+
+Si no hay ningun archivo, no se hace nada: la imagen no tiene credenciales por
+defecto y SSH permanece cerrado. El servicio corre una sola vez
+(/var/lib/galileo-provision.done).
