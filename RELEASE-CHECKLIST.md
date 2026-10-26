@@ -141,3 +141,53 @@ keep `empty-root-password` for the console only.
 01/01/2014). It is **not** a SIMATIC IOT2000: that is a re-brand of the same silicon,
 and it was used as the starting point for the BSP (`meta-iot2000`). `MACHINE =
 "iot2000"` is kept as the technical identifier.
+
+---
+
+## Verification log — v0.1.0-rc1 (2026-10-26)
+
+Measured on hardware, on the exact artifact that is published
+(`galileo-wrynose-0.1.0-rc1.wic.bz2`, sha256
+`e1a3b0a62b07e7a789fc5e6b6da0d2bfc69a232c9d8dc6a4769cd62c8ed03193`).
+
+| Gate | Result |
+|---|---|
+| No `LOCK` prefix in the kernel | 0 in `vmlinux`, 0 in all 588 modules |
+| A/B, both roots populated | 184 MB each, same busybox hash |
+| Manual switch to the standby root | boots `platform1`, kernel and userspace up |
+| **Automatic rollback with a broken userspace** | `ustate 2 (TESTING)` not confirmed → next boot: `revision 0`, `ustate 3 (FAILED)`, board returns to `platform0` by itself |
+| Root filesystem size | 184 MB, image 140 MB compressed |
+| `hw-smoke.sh` on the board | `TODO PASS`, with `wlan0` reported as SKIP |
+| **20 cold boots** | 20/20 clean: always `platform0`, `ustate 0` in both slots, revisions stable, 0 failed units |
+| SSH | password login with PAM; `PermitEmptyPasswords no`; no key baked into the image |
+
+### Still not verified (do not claim these)
+
+- **Long soak (12–24 h of continuous uptime).** 20 cold boots prove it starts; they
+  say nothing about memory leaks or SD wear.
+- **Runtime SSE/CMOV check under QEMU `pentium`.** Only a static scan was done: the
+  instruction set is absent from everything the image executes, but no runtime
+  test in an emulated CPU without SSE has been run.
+- **`hw-smoke.sh` mutation testing.** Two real failures proved *those two* checks
+  can fail; the rest are not proven to fail when they should.
+- **Power loss during a write.** The rollback was tested with a broken userspace,
+  not with an unclean shutdown mid-write.
+- **Reproducible build from `kas`.** The image was built from a working tree; a
+  clean `kas-container` build has not been compared against it. The README
+  therefore does not claim reproducibility.
+- **License manifest completeness.** 776 of 833 packages resolved; 57 subpackages
+  inherit their parent recipe's license and are listed as such in the manifest.
+
+### Operational notes learned the hard way
+
+- **The two roots are independent filesystems.** Configuration made while running
+  `platform0` (network, SSH keys, passwords) does **not** exist in `platform1`. After
+  a rollback the board may therefore come back with the *other* root's network
+  configuration — including the factory default IP. This is expected A/B behaviour,
+  not data loss: anything that must survive a root switch belongs in `/data`
+  (the `persistent` partition).
+- **`galileo-confirm.service` refuses to confirm when the network is not up**, which
+  is why an unconfirmed standby root can roll back even though the system booted
+  far enough to accept a console login.
+- **The board needs up to ~40 s to accept SSH after a cold boot** (400 MHz Quark).
+  Health checks with short timeouts report false negatives.
