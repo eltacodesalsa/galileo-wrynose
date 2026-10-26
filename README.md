@@ -2,7 +2,9 @@
 
 A current Yocto image for the Intel Galileo Gen 2 (Intel Quark X1000), built on Yocto 6.0.4 "wrynose" with a real A/B boot chain.
 
-The board is QUARK/GalileoGen2, BIOS 0x01010000 01/01/2014. Siemens' SIMATIC IOT2000 is a re-brand of the same silicon, and its BSP (meta-iot2000) is used here as the starting point. The Yocto MACHINE is still called iot2000 because it inherits that machine definition (tune i586-nlp-32, ACPI tables); it is a technical identifier, not the identity of the board.
+The board is QUARK/GalileoGen2, BIOS 0x01010000 01/01/2014. 
+Siemens' SIMATIC IOT2000 is a re-brand of the same silicon, and its BSP (meta-iot2000) is used here as the starting point. 
+The Yocto MACHINE is still called iot2000 because it inherits that machine definition (tune i586-nlp-32, ACPI tables); it is a technical identifier, not the identity of the board.
 
 > Community project, not a product. "Intel" and "Galileo" are trademarks of Intel
 > Corporation and "SIMATIC"/"IOT2000" of Siemens AG; they are named here in their
