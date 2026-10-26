@@ -1,5 +1,11 @@
 # galileoWrynose
 
+╭─╴╭─╮╷  ╷╷  ╭─╴╭─╮   ╷ ╷╭─╮╷ ╷╭╮╷╭─╮╭─╮╭─╴   
+│╶╮├─┤│  ││  ├╴ │ │   │╷│├┬╯╰┬╯│╰┤│ │╰─╮├╴    
+╰─╯╵ ╵╰─╴╵╰─╴╰─╴╰─╯   ╰┴╯╵╰╴ ╵ ╵ ╵╰─╯╰─╯╰─╴ 
+
+
+
 A current Yocto image for the **Intel Galileo Gen 2** (Intel Quark X1000),
 built on **Yocto 6.0.4 "wrynose"** with a real A/B boot chain.
 
