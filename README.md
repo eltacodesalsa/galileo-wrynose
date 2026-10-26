@@ -54,6 +54,21 @@ Kernel 6.18.52, compiled with `-Wa,-momit-lock-prefix=yes` (Quark `LOCK` errata)
 
 ## First boot
 
+> ### 🔑 Initial credentials
+> ```text
+> user:      root
+> password:  galileo
+> ```
+> The password is **expired on first login**: the system forces you to choose a new
+> one immediately, and `galileo` stops working after that. Do it before connecting
+> the board to any network you do not control.
+>
+> Prefer no password at all? Put `galileo-keys.txt` (one public key per line) in the
+> FAT boot partition before the first boot — SSH then accepts keys only and the file
+> is deleted. Same partition, `galileo-password.txt`, if you want your own password
+> without typing it on the console.
+
+
 ```
 EFI Boot Guard v0.22
 2 config partitions detected.
@@ -87,6 +102,31 @@ galileo login:
 
   With neither file, the default `root`/`galileo` applies and expires on first
   use.
+
+## Setting it up: `galileosetup`
+
+A menu-driven tool on the board, written in POSIX shell with no dependencies — no
+Python, no `mraa`, no `snack`. Run it from the serial console or over SSH:
+
+```sh
+galileosetup
+```
+
+| Menu | What it does |
+|---|---|
+| **Hostname** | changes the name the board announces on the network |
+| **Password** | sets the root password (asks twice, minimum 4 characters) |
+| **Timezone** | continent → country → zone, listing only zones present on the system |
+| **Wired network** | static or DHCP on `eth0`; applies the change immediately, no reboot |
+| **WiFi network** | scans, asks for the passphrase, writes the config, brings the link up |
+| **Show status** | kernel, uptime, addresses, disk, watchdog, loaded modules |
+| **Hardware test** | runs `hw-smoke.sh` and prints PASS/FAIL/SKIP per subsystem |
+
+It reads and writes plain configuration files (`/etc/hostname`,
+`/etc/network/interfaces`, `/etc/wpa_supplicant.conf`), so anything it does can also
+be done by hand — it is a convenience, not a daemon, and nothing depends on it at
+boot. The banner adapts to an 8-line art layout on 90+ column terminals and to a
+3-line compact one on an 80×24 console.
 
 ## A/B semantics (measured, not assumed)
 
